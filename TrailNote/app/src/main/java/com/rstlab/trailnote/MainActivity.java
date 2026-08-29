@@ -975,6 +975,11 @@ public class MainActivity extends Activity {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (vault.hasPin() && !vault.isSessionUnlocked()) {
+            pendingBackupPassphrase = null;
+            toast("Vaultが再ロックされました。解除後にもう一度操作してください");
+            return;
+        }
         if (resultCode != RESULT_OK || data == null || data.getData() == null) {
             pendingBackupPassphrase = null;
             return;
