@@ -2,6 +2,15 @@ plugins {
     id 'com.android.application'
 }
 
+def signingStoreFile = System.getenv('TRAILNOTE_SIGNING_STORE_FILE')
+def signingStorePassword = System.getenv('TRAILNOTE_SIGNING_STORE_PASSWORD')
+def signingKeyAlias = System.getenv('TRAILNOTE_SIGNING_KEY_ALIAS')
+def signingKeyPassword = System.getenv('TRAILNOTE_SIGNING_KEY_PASSWORD')
+def rawTrustedCert = System.getenv('TRAILNOTE_TRUSTED_CERT_SHA256') ?: ''
+def trustedCertSha256 = rawTrustedCert.replaceAll('[^0-9A-Fa-f]', '').toLowerCase()
+def hasProductionSigning = [signingStoreFile, signingStorePassword, signingKeyAlias, signingKeyPassword]
+        .every { it != null && !it.trim().isEmpty() }
+
 android {
     namespace 'com.rstlab.trailnote'
     compileSdk 35
@@ -14,27 +23,57 @@ android {
         applicationId 'com.rstlab.trailnote'
         minSdk 26
         targetSdk 35
-        versionCode 5
-        versionName '2.0.0'
+        versionCode 6
+        versionName '2.1.0'
+        buildConfigField 'String', 'DISTRIBUTION_TRUST_MODE', '"diagnostic"'
+        buildConfigField 'String', 'TRUSTED_SIGNING_CERT_SHA256', '""'
+    }
+
+    signingConfigs {
+        if (hasProductionSigning) {
+            production {
+                storeFile file(signingStoreFile)
+                storePassword signingStorePassword
+                keyAlias signingKeyAlias
+                keyPassword signingKeyPassword
+                enableV1Signing false
+                enableV2Signing true
+            }
+        }
     }
 
     buildTypes {
         debug {
+            applicationIdSuffix '.debug'
+            versionNameSuffix '-debug'
             minifyEnabled false
+            buildConfigField 'String', 'DISTRIBUTION_TRUST_MODE', '"diagnostic"'
+            buildConfigField 'String', 'TRUSTED_SIGNING_CERT_SHA256', '""'
         }
+
         release {
             debuggable false
             minifyEnabled true
             shrinkResources true
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            buildConfigField 'String', 'DISTRIBUTION_TRUST_MODE', '"production"'
+            buildConfigField 'String', 'TRUSTED_SIGNING_CERT_SHA256', "\"${trustedCertSha256}\""
+            if (hasProductionSigning) {
+                signingConfig signingConfigs.production
+            }
         }
+
         hardened {
             initWith release
+            applicationIdSuffix '.diagnostic'
+            versionNameSuffix '-diagnostic'
             debuggable false
             minifyEnabled true
             shrinkResources true
-            // Installable CI artifact. Production distribution should replace this with a private release key.
+            // Diagnostic artifact is intentionally isolated from the production package/signing domain.
             signingConfig signingConfigs.debug
+            buildConfigField 'String', 'DISTRIBUTION_TRUST_MODE', '"diagnostic"'
+            buildConfigField 'String', 'TRUSTED_SIGNING_CERT_SHA256', '""'
             matchingFallbacks = ['release']
         }
     }
@@ -42,5 +81,27 @@ android {
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+def verifyProductionTrustConfig = tasks.register('verifyProductionTrustConfig') {
+    group = 'verification'
+    description = 'Fail closed unless production signing identity and certificate pin are configured.'
+    doLast {
+        if (!hasProductionSigning) {
+            throw new GradleException('Production build refused: dedicated signing keystore credentials are not configured.')
+        }
+        if (trustedCertSha256.size() != 64) {
+            throw new GradleException('Production build refused: TRAILNOTE_TRUSTED_CERT_SHA256 must be one SHA-256 fingerprint (64 hex chars).')
+        }
+        if (!file(signingStoreFile).isFile()) {
+            throw new GradleException('Production build refused: signing keystore file is missing.')
+        }
+    }
+}
+
+tasks.configureEach { task ->
+    if (task.name == 'preReleaseBuild') {
+        task.dependsOn verifyProductionTrustConfig
     }
 }

@@ -1,0 +1,196 @@
+name: TrailNote Trusted Builder
+
+on:
+  workflow_call:
+    inputs:
+      production:
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+
+jobs:
+  diagnostic:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout immutable action revision
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a
+        with:
+          gradle-version: "8.9"
+
+      - name: Lint and build isolated diagnostic APKs
+        working-directory: TrailNote
+        run: gradle :app:lintHardened :app:assembleHardened :app:assembleDebug --stacktrace --no-daemon
+
+      - name: Ensure build did not mutate tracked source
+        run: |
+          set -euo pipefail
+          git diff --exit-code
+          test -z "$(git status --porcelain --untracked-files=no)"
+
+      - name: Build diagnostic integrity manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p TrailNote/dist
+          cp TrailNote/app/build/outputs/apk/hardened/app-hardened.apk TrailNote/dist/TrailNote-2.1.0-diagnostic.apk
+          HASH="$(sha256sum TrailNote/dist/TrailNote-2.1.0-diagnostic.apk | awk '{print $1}')"
+          printf '%s  %s\n' "$HASH" 'TrailNote-2.1.0-diagnostic.apk' > TrailNote/dist/SHA256SUMS-diagnostic.txt
+          printf '{"artifact":"TrailNote-2.1.0-diagnostic.apk","sha256":"%s","source_commit":"%s","workflow_run":"%s","trust_mode":"diagnostic","production_trusted":false}\n' \
+            "$HASH" "$GITHUB_SHA" "$GITHUB_RUN_ID" > TrailNote/dist/diagnostic-trust.json
+
+      - name: Generate Sigstore/GitHub provenance for diagnostic APK
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-path: TrailNote/dist/TrailNote-2.1.0-diagnostic.apk
+
+      - name: Verify generated provenance immediately
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh attestation verify TrailNote/dist/TrailNote-2.1.0-diagnostic.apk --repo "$GITHUB_REPOSITORY"
+
+      - name: Upload attested diagnostic bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: TrailNote-v2.1-diagnostic-attested
+          path: |
+            TrailNote/dist/TrailNote-2.1.0-diagnostic.apk
+            TrailNote/dist/SHA256SUMS-diagnostic.txt
+            TrailNote/dist/diagnostic-trust.json
+          if-no-files-found: error
+          retention-days: 30
+
+  production:
+    if: ${{ inputs.production }}
+    needs: diagnostic
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: trailnote-production-signing
+    steps:
+      - name: Checkout approved source without persisted credentials
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a
+        with:
+          gradle-version: "8.9"
+
+      - name: Validate production signing boundary inputs
+        shell: bash
+        env:
+          KEYSTORE_B64: ${{ secrets.TRAILNOTE_SIGNING_KEYSTORE_B64 }}
+          STORE_PASSWORD: ${{ secrets.TRAILNOTE_SIGNING_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.TRAILNOTE_SIGNING_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.TRAILNOTE_SIGNING_KEY_PASSWORD }}
+          TRUSTED_CERT: ${{ secrets.TRAILNOTE_TRUSTED_CERT_SHA256 }}
+        run: |
+          set -euo pipefail
+          test -n "$KEYSTORE_B64"
+          test -n "$STORE_PASSWORD"
+          test -n "$KEY_ALIAS"
+          test -n "$KEY_PASSWORD"
+          NORMALIZED="$(printf '%s' "$TRUSTED_CERT" | tr -cd '0-9A-Fa-f' | tr 'A-F' 'a-f')"
+          test "${#NORMALIZED}" -eq 64
+          umask 077
+          KEYSTORE="$RUNNER_TEMP/trailnote-production-signing.keystore"
+          printf '%s' "$KEYSTORE_B64" | base64 --decode > "$KEYSTORE"
+          test -s "$KEYSTORE"
+          echo "TRAILNOTE_SIGNING_STORE_FILE=$KEYSTORE" >> "$GITHUB_ENV"
+          echo "TRAILNOTE_TRUSTED_CERT_SHA256=$NORMALIZED" >> "$GITHUB_ENV"
+
+      - name: Lint and build fail-closed production APK
+        working-directory: TrailNote
+        env:
+          TRAILNOTE_SIGNING_STORE_PASSWORD: ${{ secrets.TRAILNOTE_SIGNING_STORE_PASSWORD }}
+          TRAILNOTE_SIGNING_KEY_ALIAS: ${{ secrets.TRAILNOTE_SIGNING_KEY_ALIAS }}
+          TRAILNOTE_SIGNING_KEY_PASSWORD: ${{ secrets.TRAILNOTE_SIGNING_KEY_PASSWORD }}
+        run: gradle :app:lintRelease :app:assembleRelease --stacktrace --no-daemon
+
+      - name: Verify APK signature identity and whole-file integrity
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p TrailNote/dist
+          cp TrailNote/app/build/outputs/apk/release/app-release.apk TrailNote/dist/TrailNote-2.1.0-production.apk
+          APKSIGNER="$(find "$ANDROID_HOME/build-tools" -type f -name apksigner | sort -V | tail -n 1)"
+          test -x "$APKSIGNER"
+          VERIFY_OUT="$($APKSIGNER verify --verbose --print-certs TrailNote/dist/TrailNote-2.1.0-production.apk)"
+          printf '%s\n' "$VERIFY_OUT"
+          printf '%s\n' "$VERIFY_OUT" | grep -Eq 'Verified using v2 scheme.*true'
+          ACTUAL="$(printf '%s\n' "$VERIFY_OUT" | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | head -n 1 | tr -cd '0-9A-Fa-f' | tr 'A-F' 'a-f')"
+          test -n "$ACTUAL"
+          test "$ACTUAL" = "$TRAILNOTE_TRUSTED_CERT_SHA256"
+          HASH="$(sha256sum TrailNote/dist/TrailNote-2.1.0-production.apk | awk '{print $1}')"
+          printf '%s  %s\n' "$HASH" 'TrailNote-2.1.0-production.apk' > TrailNote/dist/SHA256SUMS-production.txt
+          printf '{"artifact":"TrailNote-2.1.0-production.apk","sha256":"%s","signing_cert_sha256":"%s","source_commit":"%s","workflow_run":"%s","repository":"%s","trust_mode":"production","apk_signature_policy":"v2-or-newer-required"}\n' \
+            "$HASH" "$ACTUAL" "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_REPOSITORY" > TrailNote/dist/production-trust.json
+
+      - name: Ensure production build did not mutate tracked source
+        run: |
+          set -euo pipefail
+          git diff --exit-code
+          test -z "$(git status --porcelain --untracked-files=no)"
+
+      - name: Generate Sigstore/GitHub provenance for production APK
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-path: TrailNote/dist/TrailNote-2.1.0-production.apk
+
+      - name: Generate provenance for production trust manifest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-path: TrailNote/dist/production-trust.json
+
+      - name: Verify production provenance before publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh attestation verify TrailNote/dist/TrailNote-2.1.0-production.apk --repo "$GITHUB_REPOSITORY"
+          gh attestation verify TrailNote/dist/production-trust.json --repo "$GITHUB_REPOSITORY"
+
+      - name: Upload production trust bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: TrailNote-v2.1-production-triple-trust
+          path: |
+            TrailNote/dist/TrailNote-2.1.0-production.apk
+            TrailNote/dist/SHA256SUMS-production.txt
+            TrailNote/dist/production-trust.json
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Destroy runner copy of signing keystore
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set +e
+          if [ -n "${TRAILNOTE_SIGNING_STORE_FILE:-}" ] && [ -f "$TRAILNOTE_SIGNING_STORE_FILE" ]; then
+            shred -u "$TRAILNOTE_SIGNING_STORE_FILE" 2>/dev/null || rm -f "$TRAILNOTE_SIGNING_STORE_FILE"
+          fi

@@ -6,19 +6,20 @@ import android.content.SharedPreferences;
 import android.os.Build;
 import android.view.WindowManager;
 
-import java.util.List;
+import com.rstlab.trailnote.securityplant.distribution.DistributionTrustPlant;
 
 /**
  * Security Container Plant: the single security gateway for TrailNote.
  *
  * All vault reads/writes, authentication, backups and key mutations pass through
- * checkpoint-based runtime threat evaluation and the tamper-evident audit ledger.
+ * runtime threat evaluation, distribution identity verification and a tamper-evident ledger.
  */
 public final class SecurityContainerPlant {
     private static final long REPORT_CACHE_MS = 2_000L;
 
     private final CryptoPlant crypto;
     private final ThreatScanner scanner;
+    private final DistributionTrustPlant distributionTrust;
     private final PlantPolicy policy;
     private final TamperLedger ledger;
     private ThreatScanner.Report lastReport;
@@ -29,17 +30,21 @@ public final class SecurityContainerPlant {
         Context app = context.getApplicationContext();
         crypto = new CryptoPlant(app);
         scanner = new ThreatScanner(app);
+        distributionTrust = new DistributionTrustPlant(app);
         policy = new PlantPolicy();
         ledger = new TamperLedger(app);
         ledgerIntegrityOkAtBoot = ledger.verify();
         hardenWindow(context);
         ThreatScanner.Report boot = report(true);
-        ledger.append("plant_boot", "Security Container Plant initialized", boot.score);
+        DistributionTrustPlant.Report dist = distributionTrust.verify();
+        ledger.append("plant_boot", "Security Container Plant initialized / " + dist.level, boot.score);
+        if (dist.critical) {
+            crypto.lockSession();
+            ledger.append("distribution_trust_block", joinSignals(dist), 100);
+        }
     }
 
-    public boolean hasPin() {
-        return crypto.hasPin();
-    }
+    public boolean hasPin() { return crypto.hasPin(); }
 
     public void setPin(String pin) throws Exception {
         enforce(PlantPolicy.Action.CHANGE_PIN);
@@ -51,7 +56,8 @@ public final class SecurityContainerPlant {
         enforce(PlantPolicy.Action.OPEN_VAULT);
         boolean ok = crypto.verifyPin(pin);
         ThreatScanner.Report r = report(true);
-        ledger.append(ok ? "vault_unlock" : "vault_unlock_failed", ok ? "session key unwrapped" : "authentication failed", r.score);
+        ledger.append(ok ? "vault_unlock" : "vault_unlock_failed",
+                ok ? "session key unwrapped" : "authentication failed", r.score);
         return ok;
     }
 
@@ -61,21 +67,10 @@ public final class SecurityContainerPlant {
         ledger.append("vault_lock", "session master key zeroized", r.score);
     }
 
-    public boolean isSessionUnlocked() {
-        return crypto.isSessionUnlocked();
-    }
-
-    public boolean isLockedOut() {
-        return crypto.isLockedOut();
-    }
-
-    public long lockoutUntil() {
-        return crypto.lockoutUntil();
-    }
-
-    public int failedAttempts() {
-        return crypto.failedAttempts();
-    }
+    public boolean isSessionUnlocked() { return crypto.isSessionUnlocked(); }
+    public boolean isLockedOut() { return crypto.isLockedOut(); }
+    public long lockoutUntil() { return crypto.lockoutUntil(); }
+    public int failedAttempts() { return crypto.failedAttempts(); }
 
     public String loadEntries(SharedPreferences legacyPrefs, String legacyKey) throws Exception {
         enforce(PlantPolicy.Action.READ_DATA);
@@ -88,9 +83,7 @@ public final class SecurityContainerPlant {
         ledger.append("vault_write", "authenticated encrypted data committed", report(false).score);
     }
 
-    public boolean hasEncryptedData() {
-        return crypto.hasEncryptedData();
-    }
+    public boolean hasEncryptedData() { return crypto.hasEncryptedData(); }
 
     public String encryptBackup(String json, String passphrase) throws Exception {
         enforce(PlantPolicy.Action.EXPORT_BACKUP);
@@ -108,32 +101,44 @@ public final class SecurityContainerPlant {
 
     public String securitySummary() {
         ThreatScanner.Report r = report(false);
-        return crypto.summary() + " / RASP " + r.level() + " " + r.score + "/100 / HMAC audit chain";
+        DistributionTrustPlant.Report d = distributionTrust.verify();
+        return crypto.summary() + " / RASP " + r.level() + " " + r.score + "/100 / "
+                + d.level + " / HMAC audit chain";
     }
 
     public boolean isHardBlocked() {
+        DistributionTrustPlant.Report dist = distributionTrust.verify();
+        if (dist.critical) return true;
         PlantPolicy.Decision d = policy.decide(report(true), PlantPolicy.Action.OPEN_VAULT, ledgerIntegrityOk());
         return !d.allowed;
     }
 
     public String riskLevel() {
-        return report(false).level();
+        DistributionTrustPlant.Report dist = distributionTrust.verify();
+        return dist.critical ? "CRITICAL" : report(false).level();
     }
 
     public int riskScore() {
-        return report(false).score;
+        return distributionTrust.verify().critical ? 100 : report(false).score;
     }
 
     public String diagnosticsReport() {
         ThreatScanner.Report r = report(true);
+        DistributionTrustPlant.Report dist = distributionTrust.verify();
         PlantPolicy.Decision d = policy.decide(r, PlantPolicy.Action.DIAGNOSTICS, ledgerIntegrityOk());
         StringBuilder sb = new StringBuilder();
         sb.append("Security Container Plant\n");
-        sb.append("mode=").append(d.mode).append(" risk=").append(r.score).append("/100\n");
+        sb.append("mode=").append(dist.critical ? "CRITICAL" : d.mode)
+                .append(" risk=").append(dist.critical ? 100 : r.score).append("/100\n");
+        sb.append("distribution=").append(dist.level).append("\n");
+        sb.append("distributionSigner=").append(dist.currentSignerSha256).append("\n");
+        sb.append("distributionApkSha256=").append(dist.apkSha256).append("\n");
+        sb.append("distributionVersion=").append(dist.versionCode).append("\n");
+        sb.append("distributionSignals=").append(joinSignals(dist)).append("\n");
         sb.append("ledger=").append(ledgerIntegrityOk() ? "OK" : "FAILED").append("\n");
         sb.append("session=").append(crypto.isSessionUnlocked() ? "UNLOCKED" : "LOCKED").append("\n");
         sb.append("pin=").append(crypto.hasPin() ? "ENABLED" : "NOT_SET").append("\n");
-        sb.append("signals=");
+        sb.append("raspSignals=");
         if (r.signals.isEmpty()) sb.append("none");
         else {
             for (int i = 0; i < r.signals.size(); i++) {
@@ -145,13 +150,12 @@ public final class SecurityContainerPlant {
         return sb.toString();
     }
 
-    public void checkpointForeground() throws SecurityException {
-        enforce(PlantPolicy.Action.READ_DATA);
-    }
+    public void checkpointForeground() throws SecurityException { enforce(PlantPolicy.Action.READ_DATA); }
 
     public void recordObscuredTouch() {
         ThreatScanner.Report r = report(true);
-        ledger.append("obscured_touch", "touch rejected due to overlay/obscured window signal", Math.min(100, r.score + 25));
+        ledger.append("obscured_touch", "touch rejected due to overlay/obscured window signal",
+                Math.min(100, r.score + 25));
     }
 
     public void recordSecurityEvent(String event, String detail) {
@@ -160,6 +164,13 @@ public final class SecurityContainerPlant {
     }
 
     private void enforce(PlantPolicy.Action action) throws SecurityException {
+        DistributionTrustPlant.Report dist = distributionTrust.verify();
+        if (dist.critical) {
+            crypto.lockSession();
+            ledger.append("distribution_policy_block", action.name() + ":" + joinSignals(dist), 100);
+            throw new SecurityException("Security Container Plant: distribution identity/integrity rejected");
+        }
+
         ThreatScanner.Report r = report(true);
         boolean ledgerOk = ledgerIntegrityOk();
         PlantPolicy.Decision decision = policy.decide(r, action, ledgerOk);
@@ -182,8 +193,16 @@ public final class SecurityContainerPlant {
         return lastReport;
     }
 
-    private boolean ledgerIntegrityOk() {
-        return ledgerIntegrityOkAtBoot && ledger.verify();
+    private boolean ledgerIntegrityOk() { return ledgerIntegrityOkAtBoot && ledger.verify(); }
+
+    private static String joinSignals(DistributionTrustPlant.Report report) {
+        if (report.signals.isEmpty()) return "none";
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < report.signals.size(); i++) {
+            if (i > 0) sb.append(',');
+            sb.append(report.signals.get(i));
+        }
+        return sb.toString();
     }
 
     private void hardenWindow(Context context) {
