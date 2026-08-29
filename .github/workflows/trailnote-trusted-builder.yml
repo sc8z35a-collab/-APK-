@@ -35,6 +35,20 @@ jobs:
         with:
           gradle-version: "8.9"
 
+      - name: Assert production signing gate fails closed in ordinary CI
+        working-directory: TrailNote
+        shell: bash
+        run: |
+          set -euo pipefail
+          LOG="$RUNNER_TEMP/production-gate.log"
+          if gradle :app:verifyProductionTrustConfig --no-daemon >"$LOG" 2>&1; then
+            cat "$LOG"
+            echo "ERROR: production signing gate unexpectedly succeeded without protected signing inputs." >&2
+            exit 1
+          fi
+          grep -q "Production build refused" "$LOG"
+          echo "PASS: production build is fail-closed outside the protected signing environment."
+
       - name: Lint and build isolated diagnostic APKs
         working-directory: TrailNote
         run: gradle :app:lintHardened :app:assembleHardened :app:assembleDebug --stacktrace --no-daemon
