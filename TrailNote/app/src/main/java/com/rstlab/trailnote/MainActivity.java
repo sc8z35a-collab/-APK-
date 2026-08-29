@@ -59,6 +59,7 @@ public class MainActivity extends Activity {
     private String selectedId;
     private boolean dark;
     private boolean unlocked;
+    private boolean vaultReadError;
     private long backgroundAt;
     private int filterMode;
     private boolean sortNewest = true;
@@ -111,6 +112,7 @@ public class MainActivity extends Activity {
     }
 
     private void showLockScreen() {
+        vault.lockSession();
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setGravity(Gravity.CENTER_HORIZONTAL);
@@ -126,6 +128,7 @@ public class MainActivity extends Activity {
         TextView title = text("TrailNote Vault", 28, true);
         title.setGravity(Gravity.CENTER);
         root.addView(title, topMargin(20));
+
         TextView desc = text("暗号化された探索ログを開くにはPINを入力してください。", 14, false);
         desc.setTextColor(muted());
         desc.setGravity(Gravity.CENTER);
@@ -133,10 +136,12 @@ public class MainActivity extends Activity {
 
         EditText pin = pinEdit("6〜12桁のPIN");
         root.addView(pin, topMargin(24));
+
         TextView lockInfo = text("", 12, true);
         lockInfo.setTextColor(danger());
         lockInfo.setGravity(Gravity.CENTER);
         root.addView(lockInfo, topMargin(8));
+
         Button unlockBtn = actionButton("ロック解除", ButtonStyle.PRIMARY);
         root.addView(unlockBtn, topMargin(14));
 
@@ -156,6 +161,7 @@ public class MainActivity extends Activity {
             }
         };
         updateLockInfo.run();
+
         unlockBtn.setOnClickListener(v -> {
             try {
                 if (vault.isLockedOut()) {
@@ -178,6 +184,7 @@ public class MainActivity extends Activity {
                 toast("ロック解除に失敗しました");
             }
         });
+
         setContentView(root);
     }
 
@@ -195,6 +202,7 @@ public class MainActivity extends Activity {
         LinearLayout box = new LinearLayout(this);
         box.setOrientation(LinearLayout.VERTICAL);
         box.setPadding(dp(20), dp(8), dp(20), 0);
+
         EditText current = null;
         if (changing) {
             current = pinEdit("現在のPIN");
@@ -204,8 +212,8 @@ public class MainActivity extends Activity {
         EditText confirm = pinEdit("新しいPINを再入力");
         box.addView(next, topMargin(10));
         box.addView(confirm, topMargin(10));
-        final EditText currentFinal = current;
 
+        final EditText currentFinal = current;
         AlertDialog dialog = new AlertDialog.Builder(this)
                 .setTitle(changing ? "PINを変更" : "PINを設定")
                 .setMessage("PINそのものは保存せず、PBKDF2-SHA256で検証値のみを保存します。")
@@ -241,6 +249,7 @@ public class MainActivity extends Activity {
         scroll.setFillViewport(true);
         scroll.setClipToPadding(false);
         scroll.setBackgroundColor(bg());
+
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setPadding(dp(16), dp(14), dp(16), dp(42));
@@ -249,10 +258,13 @@ public class MainActivity extends Activity {
 
         root.addView(buildHero());
         root.addView(buildStats(), topMargin(12));
+
         root.addView(sectionHeader("SECURITY", "TrailNote Vault"), topMargin(28));
         root.addView(buildSecurityCard(), topMargin(10));
+
         root.addView(sectionHeader("LOG EDITOR", "探索ログを追加・編集"), topMargin(28));
         root.addView(buildEditorCard(), topMargin(10));
+
         root.addView(sectionHeader("LIBRARY", "記録を探す・絞り込む"), topMargin(28));
         root.addView(buildSearchCard(), topMargin(10));
 
@@ -266,6 +278,7 @@ public class MainActivity extends Activity {
         resultsLabel.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
         listHeader.addView(resultsLabel, wrap());
         root.addView(listHeader, topMargin(24));
+
         listContainer = new LinearLayout(this);
         listContainer.setOrientation(LinearLayout.VERTICAL);
         root.addView(listContainer, topMargin(4));
@@ -282,20 +295,24 @@ public class MainActivity extends Activity {
         privacy.setGravity(Gravity.CENTER);
         privacyCard.addView(privacy, topMargin(5));
         root.addView(privacyCard, topMargin(26));
+
         setContentView(scroll);
     }
 
     private View buildHero() {
         LinearLayout hero = panel(dp(20), heroBg(), true);
         hero.setPadding(dp(20), dp(20), dp(20), dp(20));
+
         LinearLayout top = new LinearLayout(this);
         top.setOrientation(LinearLayout.HORIZONTAL);
         top.setGravity(Gravity.CENTER_VERTICAL);
+
         TextView mark = text("TN", 16, true);
         mark.setGravity(Gravity.CENTER);
         mark.setTextColor(Color.WHITE);
         mark.setBackground(round(accent(), dp(14), 0, Color.TRANSPARENT));
         top.addView(mark, new LinearLayout.LayoutParams(dp(48), dp(48)));
+
         LinearLayout titles = new LinearLayout(this);
         titles.setOrientation(LinearLayout.VERTICAL);
         TextView brand = text("TrailNote", 29, true);
@@ -308,9 +325,12 @@ public class MainActivity extends Activity {
         tp.leftMargin = dp(14);
         top.addView(titles, tp);
         hero.addView(top);
+
         TextView lead = text("森・田舎・撮影スポットを、暗号化された自分だけの探索ライブラリに。", 15, false);
+        lead.setTextColor(fg());
         lead.setLineSpacing(0, 1.2f);
         hero.addView(lead, topMargin(18));
+
         TextView badge = text("●  KEYSTORE ENCRYPTED", 11, true);
         badge.setTextColor(accent());
         badge.setPadding(dp(10), dp(6), dp(10), dp(6));
@@ -324,12 +344,15 @@ public class MainActivity extends Activity {
     private View buildStats() {
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
+
         StatBlock total = statBlock("TOTAL", "0", "記録");
         totalValue = total.value;
         row.addView(total.root, weightWithRight(8));
+
         StatBlock fav = statBlock("FAVORITE", "0", "お気に入り");
         favoriteValue = fav.value;
         row.addView(fav.root, weightWithRight(8));
+
         StatBlock filmed = statBlock("FILMED", "0", "撮影済み");
         filmedValue = filmed.value;
         row.addView(filmed.root, weight());
@@ -339,6 +362,7 @@ public class MainActivity extends Activity {
     private View buildSecurityCard() {
         LinearLayout card = panel(dp(18), cardBg(), true);
         card.setPadding(dp(16), dp(16), dp(16), dp(16));
+
         LinearLayout header = new LinearLayout(this);
         header.setOrientation(LinearLayout.HORIZONTAL);
         header.setGravity(Gravity.CENTER_VERTICAL);
@@ -348,9 +372,11 @@ public class MainActivity extends Activity {
         securityStatus.setPadding(dp(9), dp(5), dp(9), dp(5));
         header.addView(securityStatus, wrap());
         card.addView(header);
+
         TextView crypto = text(vault.securitySummary(), 12, false);
         crypto.setTextColor(muted());
         card.addView(crypto, topMargin(7));
+
         TextView protection = text("ログ本体を暗号化保存 / 画面キャプチャ防止 / PIN失敗ロックアウト / 30秒自動再ロック", 13, false);
         protection.setTextColor(secondaryText());
         protection.setLineSpacing(0, 1.15f);
@@ -377,6 +403,7 @@ public class MainActivity extends Activity {
         backupLabel.setTextColor(muted());
         backupLabel.setLetterSpacing(0.10f);
         card.addView(backupLabel, topMargin(14));
+
         LinearLayout backup = new LinearLayout(this);
         backup.setOrientation(LinearLayout.HORIZONTAL);
         Button exportBtn = actionButton("暗号化書き出し", ButtonStyle.SECONDARY);
@@ -386,6 +413,7 @@ public class MainActivity extends Activity {
         card.addView(backup, topMargin(6));
         exportBtn.setOnClickListener(v -> requestEncryptedExport());
         importBtn.setOnClickListener(v -> requestEncryptedImport());
+
         refreshSecurityStatus();
         return card;
     }
@@ -401,6 +429,7 @@ public class MainActivity extends Activity {
     private View buildEditorCard() {
         LinearLayout card = panel(dp(18), cardBg(), true);
         card.setPadding(dp(16), dp(16), dp(16), dp(16));
+
         LinearLayout mode = new LinearLayout(this);
         mode.setOrientation(LinearLayout.HORIZONTAL);
         mode.setGravity(Gravity.CENTER_VERTICAL);
@@ -412,18 +441,23 @@ public class MainActivity extends Activity {
         formModeLabel.setBackground(round(accentSoft(), dp(16), 0, Color.TRANSPARENT));
         mode.addView(formModeLabel, wrap());
         card.addView(mode);
+
         card.addView(fieldLabel("タイトル", true), topMargin(16));
         titleInput = edit("例：旧林道の夕景スポット", false);
         card.addView(titleInput, topMargin(6));
+
         card.addView(fieldLabel("場所・エリア", false), topMargin(13));
         placeInput = edit("例：○○市 北部林道", false);
         card.addView(placeInput, topMargin(6));
+
         card.addView(fieldLabel("タグ", false), topMargin(13));
         tagsInput = edit("森, 廃道, 夕景", false);
         card.addView(tagsInput, topMargin(6));
+
         card.addView(fieldLabel("撮影メモ", false), topMargin(13));
         memoInput = edit("ルート、光の向き、危険箇所、次回撮りたいカットなど", true);
         card.addView(memoInput, topMargin(6));
+
         LinearLayout checks = new LinearLayout(this);
         checks.setOrientation(LinearLayout.HORIZONTAL);
         favoriteInput = check("★ お気に入り");
@@ -431,9 +465,11 @@ public class MainActivity extends Activity {
         checks.addView(favoriteInput, weightWithRight(4));
         checks.addView(filmedInput, weight());
         card.addView(checks, topMargin(10));
+
         Button saveBtn = actionButton("暗号化して保存", ButtonStyle.PRIMARY);
         card.addView(saveBtn, topMargin(12));
         saveBtn.setOnClickListener(v -> saveEntry());
+
         LinearLayout secondaryActions = new LinearLayout(this);
         secondaryActions.setOrientation(LinearLayout.HORIZONTAL);
         Button newBtn = actionButton("新規に戻す", ButtonStyle.SECONDARY);
@@ -449,13 +485,16 @@ public class MainActivity extends Activity {
     private View buildSearchCard() {
         LinearLayout card = panel(dp(18), cardBg(), true);
         card.setPadding(dp(16), dp(16), dp(16), dp(16));
+
         searchInput = edit("検索：タイトル / 場所 / タグ / メモ", false);
         card.addView(searchInput);
         favoriteOnly = check("★ お気に入りだけ表示");
         card.addView(favoriteOnly, topMargin(6));
+
         filterStatus = text("表示: すべて • 新しい順", 12, true);
         filterStatus.setTextColor(accent());
         card.addView(filterStatus, topMargin(6));
+
         LinearLayout filters = new LinearLayout(this);
         filters.setOrientation(LinearLayout.HORIZONTAL);
         Button stateBtn = actionButton("状態フィルタ", ButtonStyle.SECONDARY);
@@ -463,8 +502,10 @@ public class MainActivity extends Activity {
         filters.addView(stateBtn, weightWithRight(8));
         filters.addView(sortBtn, weight());
         card.addView(filters, topMargin(8));
+
         Button nextBtn = actionButton("🎯 次に撮る候補をランダム選択", ButtonStyle.PRIMARY);
         card.addView(nextBtn, topMargin(8));
+
         searchInput.addTextChangedListener(new TextWatcher() {
             @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
             @Override public void onTextChanged(CharSequence s, int start, int before, int count) { render(); }
@@ -482,6 +523,7 @@ public class MainActivity extends Activity {
             render();
         });
         nextBtn.setOnClickListener(v -> pickNextToShoot());
+
         return card;
     }
 
@@ -676,10 +718,12 @@ public class MainActivity extends Activity {
             totalValue.setText(String.valueOf(all.length()));
             favoriteValue.setText(String.valueOf(fav));
             filmedValue.setText(String.valueOf(filmed));
+
             listContainer.removeAllViews();
             String q = searchInput == null ? "" : searchInput.getText().toString().trim().toLowerCase(Locale.ROOT);
             boolean favOnly = favoriteOnly != null && favoriteOnly.isChecked();
             int shown = 0;
+
             int start = sortNewest ? all.length() - 1 : 0;
             int end = sortNewest ? -1 : all.length();
             int step = sortNewest ? -1 : 1;
@@ -708,10 +752,12 @@ public class MainActivity extends Activity {
         boolean filmed = o.optBoolean("filmed");
         boolean favorite = o.optBoolean("favorite");
         String id = o.optString("id");
+
         LinearLayout outer = new LinearLayout(this);
         outer.setOrientation(LinearLayout.HORIZONTAL);
         outer.setBackground(round(selected ? selectedCardBg() : cardBg(), dp(18), dp(1), selected ? selectedAccent() : border()));
         outer.setElevation(dp(selected ? 4 : 2));
+
         View accentBar = new View(this);
         accentBar.setBackground(round(favorite ? accent() : (filmed ? success() : border()), dp(12), 0, Color.TRANSPARENT));
         LinearLayout.LayoutParams barParams = new LinearLayout.LayoutParams(dp(5), ViewGroup.LayoutParams.MATCH_PARENT);
@@ -719,16 +765,19 @@ public class MainActivity extends Activity {
         barParams.topMargin = dp(10);
         barParams.bottomMargin = dp(10);
         outer.addView(accentBar, barParams);
+
         LinearLayout content = new LinearLayout(this);
         content.setOrientation(LinearLayout.VERTICAL);
         content.setPadding(dp(13), dp(14), dp(14), dp(14));
         outer.addView(content, weight());
+
         LinearLayout titleRow = new LinearLayout(this);
         titleRow.setOrientation(LinearLayout.HORIZONTAL);
         titleRow.setGravity(Gravity.CENTER_VERTICAL);
         TextView title = text((favorite ? "★ " : "") + o.optString("title", "無題"), 18, true);
         title.setMaxLines(2);
         titleRow.addView(title, weight());
+
         TextView state = text(filmed ? "撮影済み" : "未撮影", 11, true);
         state.setTextColor(filmed ? success() : muted());
         state.setPadding(dp(9), dp(5), dp(9), dp(5));
@@ -737,6 +786,7 @@ public class MainActivity extends Activity {
         stateParams.leftMargin = dp(8);
         titleRow.addView(state, stateParams);
         content.addView(titleRow);
+
         String place = o.optString("place");
         long created = o.optLong("createdAt", 0L);
         String meta = format(created);
@@ -744,8 +794,10 @@ public class MainActivity extends Activity {
         TextView metaView = text(meta, 12, false);
         metaView.setTextColor(muted());
         content.addView(metaView, topMargin(6));
+
         String tags = o.optString("tags");
         if (!tags.trim().isEmpty()) content.addView(tagRow(tags), topMargin(9));
+
         String memo = o.optString("memo");
         if (!memo.isEmpty()) {
             TextView memoView = text(memo.length() > 180 ? memo.substring(0, 180) + "…" : memo, 14, false);
@@ -753,6 +805,7 @@ public class MainActivity extends Activity {
             memoView.setLineSpacing(0, 1.15f);
             content.addView(memoView, topMargin(10));
         }
+
         LinearLayout quick = new LinearLayout(this);
         quick.setOrientation(LinearLayout.HORIZONTAL);
         Button favBtn = miniButton(favorite ? "★解除" : "★追加");
@@ -765,9 +818,11 @@ public class MainActivity extends Activity {
         favBtn.setOnClickListener(v -> toggleFavorite(id));
         filmBtn.setOnClickListener(v -> toggleFilmed(id));
         copyBtn.setOnClickListener(v -> duplicateEntry(id));
+
         TextView hint = text(selected ? "● 編集中" : "カード本体をタップして編集", 11, true);
         hint.setTextColor(selected ? selectedAccent() : muted());
         content.addView(hint, topMargin(9));
+
         outer.setOnClickListener(v -> selectEntry(o));
         return outer;
     }
@@ -820,13 +875,19 @@ public class MainActivity extends Activity {
 
     private JSONArray load() {
         try {
-            return new JSONArray(vault.loadEntries(prefs, KEY_ENTRIES));
+            JSONArray result = new JSONArray(vault.loadEntries(prefs, KEY_ENTRIES));
+            vaultReadError = false;
+            return result;
         } catch (Exception e) {
+            vaultReadError = true;
             return new JSONArray();
         }
     }
 
     private void persist(JSONArray all) throws Exception {
+        if (vaultReadError) {
+            throw new SecurityException("Vault integrity/read error: refusing to overwrite protected data");
+        }
         vault.saveEntries(all.toString());
     }
 
@@ -846,6 +907,7 @@ public class MainActivity extends Activity {
         EditText b = passwordEdit("パスフレーズを再入力");
         box.addView(a, topMargin(6));
         box.addView(b, topMargin(10));
+
         AlertDialog dialog = new AlertDialog.Builder(this)
                 .setTitle("暗号化バックアップ")
                 .setMessage("バックアップ専用のパスフレーズでAES-256-GCM暗号化します。PINとは別にできます。")
@@ -886,6 +948,7 @@ public class MainActivity extends Activity {
         box.setOrientation(LinearLayout.VERTICAL);
         box.setPadding(dp(20), dp(8), dp(20), 0);
         box.addView(pass);
+
         AlertDialog dialog = new AlertDialog.Builder(this)
                 .setTitle("暗号化バックアップを復元")
                 .setMessage("正しいパスフレーズを入力してください。")
@@ -935,7 +998,9 @@ public class MainActivity extends Activity {
                 byte[] chunk = new byte[8192];
                 int n;
                 while ((n = in.read(chunk)) != -1) {
-                    if (buffer.size() + n > 10 * 1024 * 1024) throw new IllegalArgumentException("バックアップが大きすぎます");
+                    if (buffer.size() + n > 10 * 1024 * 1024) {
+                        throw new IllegalArgumentException("バックアップが大きすぎます");
+                    }
                     buffer.write(chunk, 0, n);
                 }
                 showImportPassphraseDialog(buffer.toString(StandardCharsets.UTF_8.name()));
@@ -1097,11 +1162,13 @@ public class MainActivity extends Activity {
     }
 
     private LinearLayout.LayoutParams wrap() {
-        return new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        return new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
     }
 
     private int dp(int value) {
-        return (int) TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, value, getResources().getDisplayMetrics());
+        return (int) TypedValue.applyDimension(
+                TypedValue.COMPLEX_UNIT_DIP, value, getResources().getDisplayMetrics());
     }
 
     private String format(long millis) {
