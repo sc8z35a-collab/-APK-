@@ -65,12 +65,15 @@ jobs:
         run: |
           set -euo pipefail
           CRYPTO=TrailNote/app/src/main/java/com/rstlab/trailnote/securityplant/CryptoPlant.java
-          grep -q 'setIsStrongBoxBacked(true)' "$CRYPTO"
-          grep -q 'HIERARCHY_PREFIX = "H4."' "$CRYPTO"
-          grep -q 'DOMAIN_WRAP_PREFIX' "$CRYPTO"
-          grep -q '"logs", "spots", "plans", "missions", "assets", "gear"' "$CRYPTO"
-          grep -q 'cipher.init(Cipher.ENCRYPT_MODE, key);' "$CRYPTO"
-          grep -q 'cipher.getIV()' "$CRYPTO"
+          grep -Fq 'setIsStrongBoxBacked(true)' "$CRYPTO"
+          grep -Fq 'HIERARCHY_PREFIX = "H4."' "$CRYPTO"
+          grep -Fq 'KEY_WORKSPACE_KEK_WRAP' "$CRYPTO"
+          grep -Fq 'DOMAIN_WRAP_PREFIX' "$CRYPTO"
+          grep -Fq '"logs", "spots", "plans", "missions", "assets", "gear"' "$CRYPTO"
+          grep -Fq 'SecurityPlantWorkspaceKEK:root:v1' "$CRYPTO"
+          grep -Fq ':workspace:v1' "$CRYPTO"
+          grep -Fq 'cipher.init(Cipher.ENCRYPT_MODE, key);' "$CRYPTO"
+          grep -Fq 'cipher.getIV()' "$CRYPTO"
           SECTION="$(sed -n '/private String encryptWithKeystore(SecretKey/,/private byte\[\] decryptWithKeystore/p' "$CRYPTO")"
           if printf '%s\n' "$SECTION" | grep -Fq 'new GCMParameterSpec'; then
             echo 'ERROR: Android Keystore encryption received a caller-provided IV.' >&2
@@ -86,15 +89,15 @@ jobs:
           PLANT=TrailNote/app/src/main/java/com/rstlab/trailnote/securityplant/SecurityContainerPlant.java
           test -s "$COMPONENT"
           test -s "$MESH"
-          grep -q 'classes(\\d*)\\.dex' "$COMPONENT"
-          grep -q 'AndroidManifest.xml' "$COMPONENT"
-          grep -q 'resources.arsc' "$COMPONENT"
-          grep -q 'cryptoGuard' "$MESH"
-          grep -q 'runtimeGuard' "$MESH"
-          grep -q 'distributionGuard' "$MESH"
-          grep -q 'storageGuard' "$MESH"
-          grep -q 'uiGuard' "$MESH"
-          grep -q 'guardMesh.evaluate' "$PLANT"
+          grep -Fq 'name.matches("classes(\\d*)\\.dex")' "$COMPONENT"
+          grep -Fq 'AndroidManifest.xml' "$COMPONENT"
+          grep -Fq 'resources.arsc' "$COMPONENT"
+          grep -Fq 'cryptoGuard' "$MESH"
+          grep -Fq 'runtimeGuard' "$MESH"
+          grep -Fq 'distributionGuard' "$MESH"
+          grep -Fq 'storageGuard' "$MESH"
+          grep -Fq 'uiGuard' "$MESH"
+          grep -Fq 'guardMesh.evaluate' "$PLANT"
 
       - name: Verify production signing has no exportable private-key fallback
         shell: bash
@@ -130,7 +133,7 @@ jobs:
           cp TrailNote/app/build/outputs/apk/hardened/app-hardened.apk TrailNote/dist/TrailNote-4.0.0-hardened-diagnostic.apk
           HASH="$(sha256sum TrailNote/dist/TrailNote-4.0.0-hardened-diagnostic.apk | awk '{print $1}')"
           printf '%s  %s\n' "$HASH" 'TrailNote-4.0.0-hardened-diagnostic.apk' > TrailNote/dist/SHA256SUMS-diagnostic.txt
-          printf '{"artifact":"TrailNote-4.0.0-hardened-diagnostic.apk","sha256":"%s","source_commit":"%s","workflow_run":"%s","trust_mode":"diagnostic","workspace_schema":3,"adaptive_engine":"1.0.0","crypto_format":"H4","hardware_root":"strongbox-first","component_integrity":"sealed","guard_mesh":5,"production_trusted":false}\n' \
+          printf '{"artifact":"TrailNote-4.0.0-hardened-diagnostic.apk","sha256":"%s","source_commit":"%s","workflow_run":"%s","trust_mode":"diagnostic","workspace_schema":3,"adaptive_engine":"1.0.0","crypto_format":"H4","key_hierarchy":"root-workspace-kek-domain-dek","hardware_root":"strongbox-first","component_integrity":"sealed","guard_mesh":5,"production_trusted":false}\n' \
             "$HASH" "$GITHUB_SHA" "$GITHUB_RUN_ID" > TrailNote/dist/diagnostic-trust.json
 
       - name: Generate Sigstore/GitHub provenance for diagnostic APK
@@ -157,8 +160,6 @@ jobs:
   production:
     if: ${{ inputs.production }}
     needs: diagnostic
-    # A production private key must be non-exportable and reachable only from this
-    # dedicated runner through its preconfigured PKCS#11 provider.
     runs-on: [self-hosted, linux, trailnote-hsm]
     timeout-minutes: 45
     environment: trailnote-production-hsm
@@ -222,7 +223,7 @@ jobs:
           test "$ACTUAL" = "$TRAILNOTE_TRUSTED_CERT_SHA256"
           HASH="$(sha256sum "$APK" | awk '{print $1}')"
           printf '%s  %s\n' "$HASH" 'TrailNote-4.0.0-production.apk' > TrailNote/dist/SHA256SUMS-production.txt
-          printf '{"artifact":"TrailNote-4.0.0-production.apk","sha256":"%s","signing_cert_sha256":"%s","source_commit":"%s","workflow_run":"%s","repository":"%s","trust_mode":"production","signing_backend":"non-exportable-pkcs11-hsm","crypto_format":"H4","hardware_root":"strongbox-first","component_integrity":"sealed","guard_mesh":5,"apk_signature_policy":"v2-v3"}\n' \
+          printf '{"artifact":"TrailNote-4.0.0-production.apk","sha256":"%s","signing_cert_sha256":"%s","source_commit":"%s","workflow_run":"%s","repository":"%s","trust_mode":"production","signing_backend":"non-exportable-pkcs11-hsm","crypto_format":"H4","key_hierarchy":"root-workspace-kek-domain-dek","hardware_root":"strongbox-first","component_integrity":"sealed","guard_mesh":5,"apk_signature_policy":"v2-v3"}\n' \
             "$HASH" "$ACTUAL" "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_REPOSITORY" > TrailNote/dist/production-trust.json
 
       - name: Ensure production build did not mutate tracked source
