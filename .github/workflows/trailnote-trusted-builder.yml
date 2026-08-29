@@ -110,7 +110,8 @@ jobs:
           grep -q -- '--ks NONE' "$SCRIPT"
           grep -q 'exportable file-keystore signing is forbidden' "$SCRIPT"
           grep -q 'TRAILNOTE_HSM_SIGNING' "$GRADLE"
-          if grep -q 'TRAILNOTE_SIGNING_KEYSTORE_B64' .github/workflows/trailnote-trusted-builder.yml; then
+          LEGACY_SECRET='TRAILNOTE_SIGNING_KEYSTORE''_B64'
+          if grep -R -q "$LEGACY_SECRET" TrailNote/app TrailNote/security; then
             echo 'ERROR: exportable production keystore secret was reintroduced.' >&2
             exit 1
           fi
