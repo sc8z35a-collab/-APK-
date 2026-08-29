@@ -4,13 +4,12 @@ import android.content.Context;
 import android.content.SharedPreferences;
 
 import com.rstlab.trailnote.SecurityVault;
+import com.rstlab.trailnote.workspace.adaptive.AdaptiveOperationsCore;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.util.ArrayList;
-import java.util.Collections;
-import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -18,10 +17,11 @@ import java.util.Map;
 import java.util.UUID;
 
 /**
- * Encrypted v3 TrailNote workspace model.
+ * Encrypted TrailNote operations workspace.
  *
- * One authenticated SecurityVault payload contains all user-owned operational data.
- * Legacy v1/v2 log arrays are migrated in-place to the v3 workspace document.
+ * Every mutation is persisted through SecurityVault and passed through Adaptive
+ * Operations Core so user-entered content can trigger deterministic offline
+ * classification, linking, safety responses and production follow-up actions.
  */
 public final class WorkspaceRepository {
     public static final String LOGS = "logs";
@@ -61,6 +61,7 @@ public final class WorkspaceRepository {
     private final SecurityVault vault;
     private final SharedPreferences legacyPrefs;
     private JSONObject root;
+    private AdaptiveOperationsCore.Result lastAdaptiveResult;
 
     public WorkspaceRepository(Context context, SecurityVault vault) {
         this.vault = vault;
@@ -84,6 +85,7 @@ public final class WorkspaceRepository {
             }
         }
         migrated |= normalizeRoot();
+        migrated |= AdaptiveOperationsCore.upgradeWorkspace(root);
         if (migrated) save();
     }
 
@@ -102,6 +104,7 @@ public final class WorkspaceRepository {
             root = new JSONObject(t);
         }
         normalizeRoot();
+        AdaptiveOperationsCore.upgradeWorkspace(root);
         save();
     }
 
@@ -118,6 +121,10 @@ public final class WorkspaceRepository {
         return count(LOGS) + count(SPOTS) + count(PLANS) + count(MISSIONS) + count(ASSETS) + count(GEAR);
     }
 
+    public synchronized AdaptiveOperationsCore.Result lastAdaptiveResult() {
+        return lastAdaptiveResult;
+    }
+
     public synchronized JSONObject add(String type, JSONObject item) throws Exception {
         requireType(type);
         requireLoaded();
@@ -126,6 +133,7 @@ public final class WorkspaceRepository {
         if (!item.has("createdAt")) item.put("createdAt", now);
         item.put("updatedAt", now);
         root.getJSONArray(type).put(item);
+        runAdaptive(type, item, true);
         save();
         return item;
     }
@@ -135,6 +143,10 @@ public final class WorkspaceRepository {
         for (int i = 0; i < arr.length(); i++) {
             if (id.equals(arr.getJSONObject(i).optString("id"))) {
                 arr.remove(i);
+                int removed = AdaptiveOperationsCore.removeGeneratedChildren(root, id);
+                root.put("lastAdaptiveAt", System.currentTimeMillis());
+                root.put("lastAdaptiveType", "delete:" + type);
+                root.put("lastAdaptiveGenerated", -removed);
                 save();
                 return true;
             }
@@ -156,6 +168,7 @@ public final class WorkspaceRepository {
         if (o == null) return false;
         o.put(key, value);
         o.put("updatedAt", System.currentTimeMillis());
+        runAdaptive(type, o, true);
         save();
         return true;
     }
@@ -165,6 +178,7 @@ public final class WorkspaceRepository {
         if (o == null) return false;
         o.put(key, value);
         o.put("updatedAt", System.currentTimeMillis());
+        runAdaptive(type, o, true);
         save();
         return true;
     }
@@ -174,6 +188,7 @@ public final class WorkspaceRepository {
         if (o == null) return false;
         o.put(key, value == null ? "" : value);
         o.put("updatedAt", System.currentTimeMillis());
+        runAdaptive(type, o, true);
         save();
         return true;
     }
@@ -279,6 +294,7 @@ public final class WorkspaceRepository {
             o.put("createdAt", System.currentTimeMillis());
             o.put("updatedAt", System.currentTimeMillis());
             root.getJSONArray(GEAR).put(o);
+            AdaptiveOperationsCore.apply(GEAR, o, root, false);
         }
         save();
     }
@@ -286,6 +302,9 @@ public final class WorkspaceRepository {
     public synchronized JSONObject summaryJson() throws Exception {
         JSONObject s = new JSONObject();
         s.put("schema", SCHEMA);
+        s.put("adaptiveEngine", root.optString("adaptiveEngineVersion", AdaptiveOperationsCore.ENGINE_VERSION));
+        s.put("lastAdaptiveAt", root.optLong("lastAdaptiveAt", 0));
+        s.put("lastAdaptiveGenerated", root.optInt("lastAdaptiveGenerated", 0));
         s.put("logs", count(LOGS));
         s.put("spots", count(SPOTS));
         s.put("plans", count(PLANS));
@@ -297,6 +316,19 @@ public final class WorkspaceRepository {
         s.put("mediaPublished", mediaPublishedPercent());
         s.put("gearReady", gearReadyPercent());
         return s;
+    }
+
+    private void runAdaptive(String type, JSONObject item, boolean allowGeneration) throws Exception {
+        lastAdaptiveResult = AdaptiveOperationsCore.apply(type, item, root, allowGeneration);
+        root.put("adaptiveEngineVersion", AdaptiveOperationsCore.ENGINE_VERSION);
+        root.put("lastAdaptiveAt", System.currentTimeMillis());
+        root.put("lastAdaptiveType", type);
+        root.put("lastAdaptiveSourceId", item.optString("id", ""));
+        root.put("lastAdaptiveConfidence", lastAdaptiveResult.confidence);
+        root.put("lastAdaptiveGenerated", lastAdaptiveResult.generatedTotal());
+        JSONArray actions = new JSONArray();
+        for (String action : lastAdaptiveResult.actions) actions.put(action);
+        root.put("lastAdaptiveActions", actions);
     }
 
     private void collectHits(List<SearchHit> hits, String type, String q, String typeLabel) throws Exception {
@@ -366,6 +398,7 @@ public final class WorkspaceRepository {
         r.put("schema", SCHEMA);
         r.put("createdAt", now);
         r.put("updatedAt", now);
+        r.put("adaptiveEngineVersion", AdaptiveOperationsCore.ENGINE_VERSION);
         r.put(LOGS, new JSONArray());
         r.put(SPOTS, new JSONArray());
         r.put(PLANS, new JSONArray());
