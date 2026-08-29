@@ -8,8 +8,6 @@ import android.content.pm.PackageManager;
 import android.content.pm.Signature;
 import android.os.Build;
 import android.os.Debug;
-import android.os.SELinux;
-import android.util.Base64;
 
 import com.rstlab.trailnote.BuildConfig;
 
@@ -18,6 +16,7 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileReader;
 import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -99,17 +98,12 @@ final class ThreatScanner {
             score += 10;
             signals.add("test-keys-build");
         }
-        try {
-            if (!SELinux.isSELinuxEnforced()) {
-                score += 32;
-                signals.add("selinux-not-enforced");
-            }
-        } catch (Throwable ignored) {
+        if (selinuxNotEnforcing()) {
+            score += 32;
+            signals.add("selinux-not-enforced");
         }
 
-        int hookScore = hookFrameworkScore(signals);
-        score += hookScore;
-        if (hookScore >= 60) critical |= false;
+        score += hookFrameworkScore(signals);
 
         if (looksLikeEmulator()) {
             score += 6;
@@ -180,6 +174,17 @@ final class ThreatScanner {
             }
         }
         return false;
+    }
+
+    private boolean selinuxNotEnforcing() {
+        File enforce = new File("/sys/fs/selinux/enforce");
+        if (!enforce.exists()) return false;
+        try (BufferedReader reader = new BufferedReader(new FileReader(enforce))) {
+            String value = reader.readLine();
+            return value != null && !"1".equals(value.trim());
+        } catch (Exception ignored) {
+            return false;
+        }
     }
 
     private boolean looksLikeEmulator() {
