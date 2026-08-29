@@ -1,61 +1,103 @@
-# TrailNote
+# TrailNote v3
 
-田舎・自然・森探索や撮影候補地を、通信なしで記録する軽量Androidアプリです。
+TrailNote is an offline Android exploration and filming operations workspace protected by the Security Container Plant.
 
-## v1.3.0 主な機能
-- 探索ログの追加・編集・削除・複製
-- タイトル / 場所 / タグ / メモ
-- お気に入り、撮影済みフラグ
-- カード上からお気に入り・撮影状態を即時切替
-- 全文検索、お気に入り絞り込み
-- 未撮影 / 撮影済み / すべて の状態フィルタ
-- 新しい順 / 古い順 の並び替え
-- 未撮影ログから「次に撮る候補」をランダム選択
-- 記録数 / お気に入り / 撮影済みの簡易統計
-- システムのダークモードに追従
+## v3.0 — Operations expansion
 
-## TrailNote Vault セキュリティー
-セキュリティー処理は `SecurityVault.java` に分離しています。PIN有効時は単なるUIロックではなく、ログ暗号鍵自体をPINとAndroid Keystoreの二要素で保護します。
+TrailNote is no longer only an exploration log. Version 3 adds a six-surface operational workspace:
 
-- ログ本体はランダム256-bitマスター鍵 + AES-256-GCMで認証付き暗号化
-- マスター鍵をAndroid KeystoreのAES鍵でラップ
-- さらにKeystoreでラップした鍵を、別salt + PIN由来鍵で二重ラップ
-- PIN解除時のみRAMへマスター鍵を展開し、ロック時にbyte配列をゼロ化して破棄
-- 6〜12桁PIN。PINそのものは保存しない
-- PIN検証: ランダムsalt + PBKDF2WithHmacSHA256 160,000 iterations
-- PIN鍵ラップ: 検証用とは別salt + PBKDF2WithHmacSHA256 220,000 iterations
-- 連続PIN失敗時の段階的ロックアウト（30秒〜最大480秒）
-- バックグラウンド30秒以上で再ロック
-- `FLAG_SECURE` で通常のスクリーンショット / 画面録画経路を遮断
-- `android:allowBackup=false` / `fullBackupContent=false`
+- **Command Center** — global stats, top filming target, quick actions, unified search and production pulse.
+- **Field Intelligence** — exploration spots + legacy/new field logs.
+- **Production Planner** — shooting plans, missions and gear/loadout readiness.
+- **Media Pipeline** — video/audio/photo/narration metadata through RAW → SELECT → EDIT → READY → PUBLISHED.
+- **Operations Analytics** — readiness score, completion KPIs, category mix and Top 5 filming targets.
+- **Security Vault** — PIN/session controls, encrypted backup and security diagnostics.
+
+### Exploration spots
+
+Each spot can store:
+
+- name / area / category / tags
+- optional latitude/longitude memo
+- priority 1–5
+- visual strength 1–5
+- novelty 1–5
+- access 1–5
+- risk 1–5
+- favorite / filmed status
+- field notes
+
+The offline `PriorityEngine` combines these values with active plans and registered media to calculate a 0–100 filming candidate score.
+
+### Production planning
+
+Shooting plans include spot, date, priority, shot list, narration ideas and BGM mood. Their state advances through `PLANNED → READY → DONE`.
+
+Missions include deadline, priority, completion conditions and 0–100% progress. Gear entries track quantity and packed state.
+
+### Media operations
+
+TrailNote stores media management metadata, not the media file itself. Assets can represent VIDEO, AUDIO, PHOTO, NARRATION or another user-defined type, with reference memo, spot, duration, notes and pipeline stage.
+
+## Encrypted v3 workspace
+
+All product data is stored as one authenticated workspace document with schema 3:
+
+- logs
+- spots
+- plans
+- missions
+- assets
+- gear
+
+Old TrailNote log-array payloads are automatically migrated into `logs` and re-saved through the encrypted vault. No new plaintext app database is introduced.
+
+## Security
+
+The existing security stack remains active around the larger application:
+
+- AES-256-GCM authenticated workspace storage
+- Android Keystore key wrapping
+- PIN-derived second key boundary
+- PBKDF2-HMAC-SHA256 PIN/backup derivation
+- in-memory master-key zeroization
+- PIN failure lockout and background auto-lock
+- screenshot/recording protection and Android 12+ overlay hiding
+- obscured-touch rejection
+- ThreatScanner RASP signals for debugger, TracerPid, hook/instrumentation/root/integrity anomalies
+- Keystore-backed HMAC tamper ledger
+- DistributionTrustPlant signing lineage, APK integrity and rollback/substitution checks
+- fail-closed production signing gate
+- SHA-256 manifests and GitHub/Sigstore artifact attestations
+
+See `SECURITY_CONTAINER_PLANT.md`, `DISTRIBUTION_TRUST_BOUNDARY.md`, and `TRAILNOTE_V3_ARCHITECTURE.md`.
+
+## Privacy / permissions
+
+- no INTERNET permission
+- no location permission
+- no background service
+- no server account
+- `allowBackup=false`
 - `usesCleartextTraffic=false`
-- v1.xの平文SharedPreferencesデータは暗号化領域へ自動移行し、旧キーを削除
-- 復号・整合性エラー発生時はfail-closedし、空データで暗号化領域を上書きしない
 
-## 暗号化バックアップ
-- 独自 `.tnvault` 形式
-- PINとは別の8文字以上パスフレーズを利用可能
-- PBKDF2WithHmacSHA256 220,000 iterations
-- AES-256-GCM + 128-bit認証タグ
-- 誤パスフレーズ・改ざんはGCM認証で検出
-- 10MiBを超える復元入力を拒否
-
-### セキュリティー上の前提
-これはアプリ層の強化防御です。root化端末、OS/カーネル自体が侵害された環境、悪意ある改造APK、デバッガを許可した開発用ビルド、物理的な高度解析まで完全に防ぐものではありません。配布用に高い保証が必要な場合は、debug APKではなく専用署名鍵による非debug release APKを使うべきです。
-
-## 権限・通信
-- INTERNET権限なし
-- 位置情報権限なし
-- バックグラウンドサービスなし
-- サーバーアカウントなし
+Coordinates are optional manual memos in v3; the app does not request device GPS permission.
 
 ## Android
-- applicationId: `com.rstlab.trailnote`
-- minSdk: 26
-- targetSdk: 35
-- compileSdk: 35
-- Java 17 / Android Gradle Plugin 8.7.3
 
-## APK
-GitHub Actionsの `TrailNote Android CI` が `trailnote-v1` ブランチへのpushで lint と debug APK ビルドを実行します。
-生成物は `TrailNote-v1-debug-apk` Artifact として保存されます。debug APK はAndroidのdebug keyで署名されるため、そのまま端末へのインストール確認に使えます。
+- canonical production applicationId: `com.rstlab.trailnote`
+- diagnostic applicationId: `com.rstlab.trailnote.diagnostic`
+- debug applicationId: `com.rstlab.trailnote.debug`
+- minSdk 26
+- targetSdk 35
+- compileSdk 35
+- Java 17
+- Android Gradle Plugin 8.7.3
+- versionCode 7
+- versionName 3.0.0
+
+## Trusted builds
+
+Ordinary branch CI verifies that the production signing gate fails closed, then builds the isolated diagnostic package, runs lint/R8, creates SHA-256 trust metadata, produces a GitHub/Sigstore Artifact Attestation and immediately verifies that attestation before artifact upload.
+
+The production job is opt-in and protected by the `trailnote-production-signing` GitHub Environment. It cannot produce the canonical production package unless dedicated signing secrets and the pinned certificate SHA-256 identity are present.

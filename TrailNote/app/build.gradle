@@ -23,8 +23,8 @@ android {
         applicationId 'com.rstlab.trailnote'
         minSdk 26
         targetSdk 35
-        versionCode 6
-        versionName '2.1.0'
+        versionCode 7
+        versionName '3.0.0'
         buildConfigField 'String', 'DISTRIBUTION_TRUST_MODE', '"diagnostic"'
         buildConfigField 'String', 'TRUSTED_SIGNING_CERT_SHA256', '""'
     }
@@ -58,9 +58,7 @@ android {
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
             buildConfigField 'String', 'DISTRIBUTION_TRUST_MODE', '"production"'
             buildConfigField 'String', 'TRUSTED_SIGNING_CERT_SHA256', "\"${trustedCertSha256}\""
-            if (hasProductionSigning) {
-                signingConfig signingConfigs.production
-            }
+            if (hasProductionSigning) signingConfig signingConfigs.production
         }
 
         hardened {
@@ -70,7 +68,6 @@ android {
             debuggable false
             minifyEnabled true
             shrinkResources true
-            // Diagnostic artifact is intentionally isolated from the production package/signing domain.
             signingConfig signingConfigs.debug
             buildConfigField 'String', 'DISTRIBUTION_TRUST_MODE', '"diagnostic"'
             buildConfigField 'String', 'TRUSTED_SIGNING_CERT_SHA256', '""'
@@ -88,20 +85,12 @@ def verifyProductionTrustConfig = tasks.register('verifyProductionTrustConfig') 
     group = 'verification'
     description = 'Fail closed unless production signing identity and certificate pin are configured.'
     doLast {
-        if (!hasProductionSigning) {
-            throw new GradleException('Production build refused: dedicated signing keystore credentials are not configured.')
-        }
-        if (trustedCertSha256.size() != 64) {
-            throw new GradleException('Production build refused: TRAILNOTE_TRUSTED_CERT_SHA256 must be one SHA-256 fingerprint (64 hex chars).')
-        }
-        if (!file(signingStoreFile).isFile()) {
-            throw new GradleException('Production build refused: signing keystore file is missing.')
-        }
+        if (!hasProductionSigning) throw new GradleException('Production build refused: dedicated signing keystore credentials are not configured.')
+        if (trustedCertSha256.size() != 64) throw new GradleException('Production build refused: TRAILNOTE_TRUSTED_CERT_SHA256 must be one SHA-256 fingerprint (64 hex chars).')
+        if (!file(signingStoreFile).isFile()) throw new GradleException('Production build refused: signing keystore file is missing.')
     }
 }
 
 tasks.configureEach { task ->
-    if (task.name == 'preReleaseBuild') {
-        task.dependsOn verifyProductionTrustConfig
-    }
+    if (task.name == 'preReleaseBuild') task.dependsOn verifyProductionTrustConfig
 }

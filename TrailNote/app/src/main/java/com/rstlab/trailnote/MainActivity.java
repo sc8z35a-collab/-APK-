@@ -3,19 +3,16 @@ package com.rstlab.trailnote;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.Intent;
-import android.content.SharedPreferences;
-import android.content.res.ColorStateList;
 import android.content.res.Configuration;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Bundle;
-import android.text.Editable;
 import android.text.InputType;
-import android.text.TextWatcher;
 import android.util.TypedValue;
 import android.view.Gravity;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.Window;
@@ -24,9 +21,12 @@ import android.widget.Button;
 import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.LinearLayout;
+import android.widget.ProgressBar;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
+
+import com.rstlab.trailnote.workspace.WorkspaceRepository;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -36,42 +36,45 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
-import java.util.ArrayList;
 import java.util.Date;
+import java.util.List;
 import java.util.Locale;
-import java.util.Random;
-import java.util.UUID;
+import java.util.Map;
 
+/** TrailNote v3 — offline exploration and filming operations workspace. */
 public class MainActivity extends Activity {
-    private static final String PREFS = "trailnote_prefs";
-    private static final String KEY_ENTRIES = "entries";
-    private static final int REQ_EXPORT_VAULT = 301;
-    private static final int REQ_IMPORT_VAULT = 302;
+    private static final int PAGE_HOME = 0;
+    private static final int PAGE_EXPLORE = 1;
+    private static final int PAGE_PLAN = 2;
+    private static final int PAGE_MEDIA = 3;
+    private static final int PAGE_ANALYZE = 4;
+    private static final int PAGE_VAULT = 5;
+    private static final int REQ_EXPORT = 401;
+    private static final int REQ_IMPORT = 402;
     private static final long AUTO_LOCK_MS = 30_000L;
+    private static final int MAX_IMPORT_BYTES = 10 * 1024 * 1024;
 
-    private SharedPreferences prefs;
     private SecurityVault vault;
-    private EditText titleInput, placeInput, tagsInput, memoInput, searchInput;
-    private CheckBox favoriteInput, filmedInput, favoriteOnly;
-    private TextView totalValue, favoriteValue, filmedValue, resultsLabel, formModeLabel;
-    private TextView securityStatus, filterStatus;
-    private LinearLayout listContainer;
-    private String selectedId;
+    private WorkspaceRepository repo;
+    private LinearLayout pageRoot;
+    private TextView headerTitle;
+    private TextView headerSubtitle;
+    private final Button[] navButtons = new Button[6];
+    private int page = PAGE_HOME;
     private boolean dark;
     private boolean unlocked;
-    private boolean vaultReadError;
     private long backgroundAt;
-    private int filterMode;
-    private boolean sortNewest = true;
-    private String pendingBackupPassphrase;
+    private String pendingExportPassphrase;
+    private String pendingImportEnvelope;
+
+    private interface StringCallback { void accept(String value); }
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
-        vault = new SecurityVault(this);
         dark = (getResources().getConfiguration().uiMode & Configuration.UI_MODE_NIGHT_MASK)
                 == Configuration.UI_MODE_NIGHT_YES;
+        vault = new SecurityVault(this);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
         styleSystemBars();
         if (vault.hasPin()) {
@@ -79,19 +82,27 @@ public class MainActivity extends Activity {
             showLockScreen();
         } else {
             unlocked = true;
-            buildUi();
-            render();
-            showFirstRunSecuritySetup();
+            openWorkspace(true);
         }
     }
 
     @Override
     protected void onStart() {
         super.onStart();
-        if (backgroundAt > 0L && unlocked && vault.hasPin()
+        if (vault == null) return;
+        if (backgroundAt > 0 && unlocked && vault.hasPin()
                 && System.currentTimeMillis() - backgroundAt >= AUTO_LOCK_MS) {
             unlocked = false;
             showLockScreen();
+            return;
+        }
+        if (unlocked) {
+            try {
+                vault.checkpointForeground();
+            } catch (SecurityException e) {
+                unlocked = false;
+                showSecurityBlock(e.getMessage());
+            }
         }
     }
 
@@ -101,1119 +112,1112 @@ public class MainActivity extends Activity {
         if (vault != null && vault.hasPin()) backgroundAt = System.currentTimeMillis();
     }
 
+    @Override
+    public boolean dispatchTouchEvent(MotionEvent event) {
+        if ((event.getFlags() & MotionEvent.FLAG_WINDOW_IS_OBSCURED) != 0) {
+            if (vault != null) vault.recordObscuredTouch();
+            return false;
+        }
+        return super.dispatchTouchEvent(event);
+    }
+
+    private void openWorkspace(boolean firstRunPrompt) {
+        try {
+            vault.checkpointForeground();
+            repo = new WorkspaceRepository(this, vault);
+            repo.load();
+            repo.seedStarterGearIfEmpty();
+            buildShell();
+            renderPage();
+            if (firstRunPrompt && !vault.hasPin()) showFirstRunSecuritySetup();
+        } catch (SecurityException e) {
+            unlocked = false;
+            showSecurityBlock(e.getMessage());
+        } catch (Exception e) {
+            showSecurityBlock("暗号化Workspaceを開けませんでした: " + safeMessage(e));
+        }
+    }
+
     private void styleSystemBars() {
         Window w = getWindow();
         w.setStatusBarColor(bg());
         w.setNavigationBarColor(bg());
         int flags = 0;
-        if (!dark) flags |= View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR;
-        if (!dark) flags |= View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR;
+        if (!dark) flags |= View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR;
         w.getDecorView().setSystemUiVisibility(flags);
     }
 
     private void showLockScreen() {
         vault.lockSession();
-        LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout root = column();
         root.setGravity(Gravity.CENTER_HORIZONTAL);
-        root.setPadding(dp(28), dp(70), dp(28), dp(28));
+        root.setPadding(dp(28), dp(72), dp(28), dp(28));
         root.setBackgroundColor(bg());
 
-        TextView shield = text("TN", 24, true);
-        shield.setTextColor(Color.WHITE);
-        shield.setGravity(Gravity.CENTER);
-        shield.setBackground(round(accent(), dp(22), 0, Color.TRANSPARENT));
-        root.addView(shield, new LinearLayout.LayoutParams(dp(72), dp(72)));
-
-        TextView title = text("TrailNote Vault", 28, true);
+        TextView mark = badge("TN", accent(), Color.WHITE);
+        mark.setTextSize(TypedValue.COMPLEX_UNIT_SP, 24);
+        root.addView(mark, size(dp(78), dp(78)));
+        TextView title = text("TrailNote Operations Vault", 27, true);
         title.setGravity(Gravity.CENTER);
-        root.addView(title, topMargin(20));
-
-        TextView desc = text("暗号化された探索ログを開くにはPINを入力してください。", 14, false);
+        root.addView(title, mt(22));
+        TextView desc = text("探索・撮影計画・素材・ミッションを保護するSecurity Container Plant", 13, false);
         desc.setTextColor(muted());
         desc.setGravity(Gravity.CENTER);
-        root.addView(desc, topMargin(7));
+        root.addView(desc, mt(8));
 
-        EditText pin = pinEdit("6〜12桁のPIN");
-        root.addView(pin, topMargin(24));
+        EditText pin = input("6〜12桁 PIN", true);
+        root.addView(pin, mt(24));
+        TextView state = text("", 12, true);
+        state.setTextColor(danger());
+        state.setGravity(Gravity.CENTER);
+        root.addView(state, mt(8));
+        Button unlock = button("Vaultを解除", true);
+        root.addView(unlock, mt(14));
 
-        TextView lockInfo = text("", 12, true);
-        lockInfo.setTextColor(danger());
-        lockInfo.setGravity(Gravity.CENTER);
-        root.addView(lockInfo, topMargin(8));
-
-        Button unlockBtn = actionButton("ロック解除", ButtonStyle.PRIMARY);
-        root.addView(unlockBtn, topMargin(14));
-
-        TextView security = text("AES-256-GCM • Android Keystore • Screenshot Shield", 11, true);
-        security.setTextColor(muted());
-        security.setGravity(Gravity.CENTER);
-        root.addView(security, topMargin(24));
-
-        Runnable updateLockInfo = () -> {
+        Runnable refresh = () -> {
             if (vault.isLockedOut()) {
-                long sec = Math.max(1L, (vault.lockoutUntil() - System.currentTimeMillis() + 999L) / 1000L);
-                lockInfo.setText("連続失敗のため約 " + sec + " 秒ロック中");
+                long sec = Math.max(1, (vault.lockoutUntil() - System.currentTimeMillis() + 999) / 1000);
+                state.setText("認証ロックアウト: 約" + sec + "秒");
             } else if (vault.failedAttempts() > 0) {
-                lockInfo.setText("PIN失敗 " + vault.failedAttempts() + " 回");
-            } else {
-                lockInfo.setText("");
-            }
+                state.setText("PIN失敗 " + vault.failedAttempts() + " 回");
+            } else state.setText("Triple Distribution Trust + AES-256-GCM");
         };
-        updateLockInfo.run();
-
-        unlockBtn.setOnClickListener(v -> {
+        refresh.run();
+        unlock.setOnClickListener(v -> {
             try {
                 if (vault.isLockedOut()) {
-                    updateLockInfo.run();
-                    toast("一時ロック中です");
+                    refresh.run();
                     return;
                 }
-                if (vault.verifyPin(pin.getText().toString())) {
-                    unlocked = true;
-                    backgroundAt = 0L;
-                    buildUi();
-                    render();
-                    toast("TrailNote Vaultを解除しました");
-                } else {
+                if (!vault.verifyPin(pin.getText().toString())) {
                     pin.setText("");
-                    updateLockInfo.run();
+                    refresh.run();
                     toast("PINが違います");
+                    return;
                 }
+                unlocked = true;
+                backgroundAt = 0;
+                openWorkspace(false);
             } catch (Exception e) {
-                toast("ロック解除に失敗しました");
+                showSecurityBlock(safeMessage(e));
             }
         });
-
         setContentView(root);
     }
 
-    private void showFirstRunSecuritySetup() {
-        new AlertDialog.Builder(this)
-                .setTitle("TrailNote Vaultを有効化")
-                .setMessage("ログ本体はすでにAndroid Keystoreで暗号化保存されます。さらにPINロックと30秒自動ロックを有効にできます。")
-                .setNegativeButton("あとで", null)
-                .setPositiveButton("PINを設定", (d, w) -> showSetPinDialog())
-                .show();
+    private void showSecurityBlock(String reason) {
+        if (vault != null) vault.lockSession();
+        LinearLayout root = column();
+        root.setGravity(Gravity.CENTER_HORIZONTAL);
+        root.setPadding(dp(26), dp(70), dp(26), dp(30));
+        root.setBackgroundColor(bg());
+        TextView mark = badge("!", danger(), Color.WHITE);
+        mark.setTextSize(TypedValue.COMPLEX_UNIT_SP, 28);
+        root.addView(mark, size(dp(72), dp(72)));
+        TextView title = text("SECURITY PLANT BLOCK", 22, true);
+        title.setGravity(Gravity.CENTER);
+        root.addView(title, mt(18));
+        TextView info = text(reason == null ? "信頼境界が保護操作を拒否しました。" : reason, 13, false);
+        info.setTextColor(muted());
+        info.setGravity(Gravity.CENTER);
+        root.addView(info, mt(10));
+        if (vault != null) {
+            TextView diag = text(vault.diagnosticsReport(), 11, false);
+            diag.setTextColor(secondary());
+            diag.setPadding(dp(14), dp(14), dp(14), dp(14));
+            diag.setBackground(round(surface(), dp(14), border()));
+            root.addView(diag, mt(20));
+        }
+        setContentView(root);
     }
 
-    private void showSetPinDialog() {
-        boolean changing = vault.hasPin();
-        LinearLayout box = new LinearLayout(this);
-        box.setOrientation(LinearLayout.VERTICAL);
-        box.setPadding(dp(20), dp(8), dp(20), 0);
+    private void buildShell() {
+        LinearLayout shell = column();
+        shell.setBackgroundColor(bg());
 
-        EditText current = null;
-        if (changing) {
-            current = pinEdit("現在のPIN");
-            box.addView(current, topMargin(6));
+        LinearLayout header = new LinearLayout(this);
+        header.setOrientation(LinearLayout.HORIZONTAL);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        header.setPadding(dp(16), dp(12), dp(16), dp(10));
+        header.setBackgroundColor(surface());
+        TextView mark = badge("TN", accent(), Color.WHITE);
+        header.addView(mark, size(dp(42), dp(42)));
+        LinearLayout titles = column();
+        headerTitle = text("Operations", 20, true);
+        headerSubtitle = text("TrailNote v3", 11, false);
+        headerSubtitle.setTextColor(muted());
+        titles.addView(headerTitle);
+        titles.addView(headerSubtitle);
+        LinearLayout.LayoutParams tp = weight();
+        tp.leftMargin = dp(11);
+        header.addView(titles, tp);
+        TextView trust = badge("VAULT", accentSoft(), accent());
+        trust.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
+        header.addView(trust, wrap());
+        shell.addView(header, new LinearLayout.LayoutParams(-1, -2));
+
+        ScrollView scroll = new ScrollView(this);
+        scroll.setFillViewport(true);
+        pageRoot = column();
+        pageRoot.setPadding(dp(15), dp(15), dp(15), dp(34));
+        scroll.addView(pageRoot, new ScrollView.LayoutParams(-1, -2));
+        shell.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1f));
+
+        LinearLayout nav = new LinearLayout(this);
+        nav.setOrientation(LinearLayout.HORIZONTAL);
+        nav.setPadding(dp(5), dp(6), dp(5), dp(8));
+        nav.setBackgroundColor(surface());
+        String[] names = {"HOME", "EXPLORE", "PLAN", "MEDIA", "ANALYZE", "VAULT"};
+        for (int i = 0; i < names.length; i++) {
+            final int target = i;
+            Button b = new Button(this);
+            b.setText(names[i]);
+            b.setTextSize(TypedValue.COMPLEX_UNIT_SP, 9);
+            b.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+            b.setAllCaps(false);
+            b.setPadding(dp(2), 0, dp(2), 0);
+            b.setMinHeight(0);
+            b.setMinimumHeight(0);
+            b.setStateListAnimator(null);
+            b.setOnClickListener(v -> {
+                page = target;
+                renderPage();
+            });
+            navButtons[i] = b;
+            nav.addView(b, new LinearLayout.LayoutParams(0, dp(48), 1f));
         }
-        EditText next = pinEdit("新しいPIN（6〜12桁）");
-        EditText confirm = pinEdit("新しいPINを再入力");
-        box.addView(next, topMargin(10));
-        box.addView(confirm, topMargin(10));
+        shell.addView(nav, new LinearLayout.LayoutParams(-1, -2));
+        setContentView(shell);
+    }
 
-        final EditText currentFinal = current;
+    private void renderPage() {
+        if (pageRoot == null || repo == null) return;
+        try {
+            vault.checkpointForeground();
+            pageRoot.removeAllViews();
+            String[] titles = {"Command Center", "Field Intelligence", "Production Planner", "Media Pipeline", "Operations Analytics", "Security Vault"};
+            String[] subs = {"探索・撮影オペレーションを一画面で把握", "スポットと探索ログを管理", "撮影・ミッション・装備を統合", "素材を公開まで追跡", "進捗と撮影候補を分析", "Security Container Plant / Triple Trust"};
+            headerTitle.setText(titles[page]);
+            headerSubtitle.setText(subs[page]);
+            for (int i = 0; i < navButtons.length; i++) styleNav(navButtons[i], i == page);
+            switch (page) {
+                case PAGE_HOME: renderHome(); break;
+                case PAGE_EXPLORE: renderExplore(); break;
+                case PAGE_PLAN: renderPlan(); break;
+                case PAGE_MEDIA: renderMedia(); break;
+                case PAGE_ANALYZE: renderAnalyze(); break;
+                case PAGE_VAULT: renderVault(); break;
+                default: renderHome();
+            }
+        } catch (SecurityException e) {
+            unlocked = false;
+            showSecurityBlock(e.getMessage());
+        } catch (Exception e) {
+            toast("表示に失敗: " + safeMessage(e));
+        }
+    }
+
+    private void renderHome() throws Exception {
+        pageRoot.addView(hero("TRAILNOTE v3", "Exploration Operations System", "探索候補から撮影・素材・公開までを、暗号化された1つのWorkspaceで管理します。"));
+
+        LinearLayout stats1 = row();
+        stats1.addView(stat("SPOTS", repo.count(WorkspaceRepository.SPOTS), "候補地"), weightMargin(6));
+        stats1.addView(stat("PLANS", repo.count(WorkspaceRepository.PLANS), "撮影計画"), weightMargin(6));
+        stats1.addView(stat("MEDIA", repo.count(WorkspaceRepository.ASSETS), "素材"), weight());
+        pageRoot.addView(stats1, mt(12));
+        LinearLayout stats2 = row();
+        stats2.addView(stat("LOGS", repo.count(WorkspaceRepository.LOGS), "探索記録"), weightMargin(6));
+        stats2.addView(stat("MISSIONS", repo.count(WorkspaceRepository.MISSIONS), "任務"), weightMargin(6));
+        stats2.addView(stat("GEAR", repo.count(WorkspaceRepository.GEAR), "装備"), weight());
+        pageRoot.addView(stats2, mt(7));
+
+        pageRoot.addView(section("QUICK OPS", "今すぐ追加"), mt(24));
+        LinearLayout quick1 = row();
+        Button spot = button("＋ スポット", true);
+        Button plan = button("＋ 撮影計画", false);
+        quick1.addView(spot, weightMargin(7));
+        quick1.addView(plan, weight());
+        pageRoot.addView(quick1, mt(9));
+        LinearLayout quick2 = row();
+        Button mission = button("＋ ミッション", false);
+        Button media = button("＋ 素材", false);
+        quick2.addView(mission, weightMargin(7));
+        quick2.addView(media, weight());
+        pageRoot.addView(quick2, mt(7));
+        spot.setOnClickListener(v -> showSpotDialog());
+        plan.setOnClickListener(v -> showPlanDialog(null));
+        mission.setOnClickListener(v -> showMissionDialog());
+        media.setOnClickListener(v -> showAssetDialog());
+
+        pageRoot.addView(section("NEXT TARGET", "撮影優先度エンジン"), mt(24));
+        List<WorkspaceRepository.Candidate> ranked = repo.rankedCandidates();
+        if (ranked.isEmpty()) {
+            pageRoot.addView(empty("スポットを登録すると、撮影候補スコアを自動計算します。"), mt(9));
+        } else {
+            WorkspaceRepository.Candidate c = ranked.get(0);
+            JSONObject s = c.spot;
+            LinearLayout card = card();
+            LinearLayout top = row();
+            TextView name = text(s.optString("title", "無題スポット"), 19, true);
+            top.addView(name, weight());
+            top.addView(scoreBadge(c.score), wrap());
+            card.addView(top);
+            TextView meta = text(s.optString("area", "場所未設定") + " • " + s.optString("category", "未分類"), 12, false);
+            meta.setTextColor(muted());
+            card.addView(meta, mt(5));
+            TextView why = text("優先度 " + s.optInt("priority", 3) + "/5  ｜ 画 " + s.optInt("rating", 3) + "/5  ｜ 新規性 " + s.optInt("novelty", 3) + "/5  ｜ 危険度 " + s.optInt("risk", 2) + "/5", 12, false);
+            why.setTextColor(secondary());
+            card.addView(why, mt(9));
+            Button makePlan = button("このスポットの撮影計画を作る", true);
+            card.addView(makePlan, mt(13));
+            makePlan.setOnClickListener(v -> showPlanDialog(s));
+            pageRoot.addView(card, mt(9));
+        }
+
+        pageRoot.addView(section("UNIFIED SEARCH", "Workspace全体を検索"), mt(24));
+        LinearLayout searchCard = card();
+        EditText search = input("場所・タグ・企画・素材名を検索", false);
+        searchCard.addView(search);
+        Button searchBtn = button("Workspace検索", false);
+        searchCard.addView(searchBtn, mt(9));
+        searchBtn.setOnClickListener(v -> showSearchResults(search.getText().toString()));
+        pageRoot.addView(searchCard, mt(9));
+
+        pageRoot.addView(section("PRODUCTION PULSE", "現在の進捗"), mt(24));
+        pageRoot.addView(progressCard("撮影計画完了", repo.planCompletionPercent(), "DONEになった撮影計画"), mt(9));
+        pageRoot.addView(progressCard("ミッション進捗", repo.missionAverageProgress(), "全ミッションの平均"), mt(7));
+        pageRoot.addView(progressCard("装備準備", repo.gearReadyPercent(), "packedチェック率"), mt(7));
+    }
+
+    private void renderExplore() throws Exception {
+        pageRoot.addView(hero("FIELD INTELLIGENCE", "Spot + Exploration Log", "現地候補を評価し、訪問記録と撮影価値を蓄積します。"));
+        LinearLayout actions = row();
+        Button addSpot = button("＋ スポット", true);
+        Button addLog = button("＋ 探索ログ", false);
+        actions.addView(addSpot, weightMargin(7));
+        actions.addView(addLog, weight());
+        pageRoot.addView(actions, mt(12));
+        addSpot.setOnClickListener(v -> showSpotDialog());
+        addLog.setOnClickListener(v -> showLogDialog(null));
+
+        pageRoot.addView(section("SPOT RANKING", "撮影候補スコア順"), mt(24));
+        List<WorkspaceRepository.Candidate> ranked = repo.rankedCandidates();
+        if (ranked.isEmpty()) pageRoot.addView(empty("まだスポットがありません。"), mt(9));
+        for (WorkspaceRepository.Candidate candidate : ranked) pageRoot.addView(spotCard(candidate), mt(8));
+
+        pageRoot.addView(section("FIELD LOG", "最近の探索記録"), mt(24));
+        List<JSONObject> logs = repo.recent(WorkspaceRepository.LOGS, 30);
+        if (logs.isEmpty()) pageRoot.addView(empty("探索ログはまだありません。"), mt(9));
+        for (JSONObject log : logs) pageRoot.addView(logCard(log), mt(8));
+    }
+
+    private View spotCard(WorkspaceRepository.Candidate candidate) {
+        JSONObject s = candidate.spot;
+        LinearLayout card = card();
+        LinearLayout top = row();
+        TextView title = text(s.optString("title", "無題スポット"), 18, true);
+        top.addView(title, weight());
+        top.addView(scoreBadge(candidate.score), wrap());
+        card.addView(top);
+        TextView meta = text(s.optString("area", "場所未設定") + "  •  " + s.optString("category", "未分類")
+                + (s.optBoolean("filmed", false) ? "  •  撮影済み" : "  •  未撮影"), 12, false);
+        meta.setTextColor(muted());
+        card.addView(meta, mt(5));
+        String tags = s.optString("tags", "");
+        if (!tags.isEmpty()) {
+            TextView tag = text("# " + tags.replace(",", "   # "), 11, true);
+            tag.setTextColor(accent());
+            card.addView(tag, mt(7));
+        }
+        TextView metrics = text("P" + s.optInt("priority", 3) + "  VIS" + s.optInt("rating", 3)
+                + "  NOV" + s.optInt("novelty", 3) + "  ACCESS" + s.optInt("access", 3) + "  RISK" + s.optInt("risk", 2), 11, true);
+        metrics.setTextColor(secondary());
+        card.addView(metrics, mt(8));
+        if (!s.optString("note", "").isEmpty()) {
+            TextView note = text(s.optString("note"), 13, false);
+            note.setTextColor(secondary());
+            card.addView(note, mt(8));
+        }
+        if (s.has("lat") && s.has("lon")) {
+            TextView coord = text("GPS memo  " + s.optString("lat") + ", " + s.optString("lon"), 11, false);
+            coord.setTextColor(muted());
+            card.addView(coord, mt(7));
+        }
+        LinearLayout buttons = row();
+        Button fav = mini(s.optBoolean("favorite", false) ? "★" : "☆");
+        Button filmed = mini(s.optBoolean("filmed", false) ? "未撮影へ" : "撮影済み");
+        Button plan = mini("計画");
+        Button del = mini("削除");
+        buttons.addView(fav, weightMargin(5));
+        buttons.addView(filmed, weightMargin(5));
+        buttons.addView(plan, weightMargin(5));
+        buttons.addView(del, weight());
+        card.addView(buttons, mt(12));
+        String id = s.optString("id");
+        fav.setOnClickListener(v -> mutate(() -> repo.setBoolean(WorkspaceRepository.SPOTS, id, "favorite", !s.optBoolean("favorite", false))));
+        filmed.setOnClickListener(v -> mutate(() -> repo.setBoolean(WorkspaceRepository.SPOTS, id, "filmed", !s.optBoolean("filmed", false))));
+        plan.setOnClickListener(v -> showPlanDialog(s));
+        del.setOnClickListener(v -> confirmDelete("スポット", () -> repo.delete(WorkspaceRepository.SPOTS, id)));
+        return card;
+    }
+
+    private View logCard(JSONObject log) {
+        LinearLayout card = card();
+        LinearLayout top = row();
+        TextView title = text(log.optString("title", "探索ログ"), 16, true);
+        top.addView(title, weight());
+        if (log.optBoolean("favorite", false)) top.addView(badge("★", accentSoft(), accent()), wrap());
+        card.addView(top);
+        TextView meta = text(log.optString("place", "場所未設定") + (log.optBoolean("filmed", false) ? " • 撮影済み" : " • 未撮影"), 11, false);
+        meta.setTextColor(muted());
+        card.addView(meta, mt(4));
+        if (!log.optString("memo", "").isEmpty()) {
+            TextView memo = text(log.optString("memo"), 12, false);
+            memo.setTextColor(secondary());
+            card.addView(memo, mt(7));
+        }
+        LinearLayout buttons = row();
+        Button toggle = mini(log.optBoolean("filmed", false) ? "未撮影へ" : "撮影済み");
+        Button del = mini("削除");
+        buttons.addView(toggle, weightMargin(6));
+        buttons.addView(del, weight());
+        card.addView(buttons, mt(10));
+        String id = log.optString("id");
+        toggle.setOnClickListener(v -> mutate(() -> repo.setBoolean(WorkspaceRepository.LOGS, id, "filmed", !log.optBoolean("filmed", false))));
+        del.setOnClickListener(v -> confirmDelete("探索ログ", () -> repo.delete(WorkspaceRepository.LOGS, id)));
+        return card;
+    }
+
+    private void renderPlan() throws Exception {
+        pageRoot.addView(hero("PRODUCTION PLANNER", "Plan + Mission + Gear", "撮影日の準備、達成すべき任務、持ち出し装備を一つの運用画面へ。"));
+        LinearLayout pulse = row();
+        pulse.addView(stat("PLAN", repo.planCompletionPercent(), "%完了"), weightMargin(6));
+        pulse.addView(stat("MISSION", repo.missionAverageProgress(), "%進行"), weightMargin(6));
+        pulse.addView(stat("GEAR", repo.gearReadyPercent(), "%準備"), weight());
+        pageRoot.addView(pulse, mt(12));
+
+        pageRoot.addView(section("SHOOTING PLAN", "撮影計画"), mt(24));
+        Button addPlan = button("＋ 新しい撮影計画", true);
+        pageRoot.addView(addPlan, mt(8));
+        addPlan.setOnClickListener(v -> showPlanDialog(null));
+        List<JSONObject> plans = repo.recent(WorkspaceRepository.PLANS, 40);
+        if (plans.isEmpty()) pageRoot.addView(empty("撮影計画はまだありません。"), mt(8));
+        for (JSONObject p : plans) pageRoot.addView(planCard(p), mt(8));
+
+        pageRoot.addView(section("MISSIONS", "探索・制作ミッション"), mt(25));
+        Button addMission = button("＋ ミッション追加", false);
+        pageRoot.addView(addMission, mt(8));
+        addMission.setOnClickListener(v -> showMissionDialog());
+        List<JSONObject> missions = repo.recent(WorkspaceRepository.MISSIONS, 40);
+        if (missions.isEmpty()) pageRoot.addView(empty("ミッションはありません。"), mt(8));
+        for (JSONObject m : missions) pageRoot.addView(missionCard(m), mt(8));
+
+        pageRoot.addView(section("FIELD LOADOUT", "持ち出し装備"), mt(25));
+        Button addGear = button("＋ 装備を追加", false);
+        pageRoot.addView(addGear, mt(8));
+        addGear.setOnClickListener(v -> showGearDialog());
+        JSONArray gear = repo.array(WorkspaceRepository.GEAR);
+        for (int i = 0; i < gear.length(); i++) pageRoot.addView(gearCard(gear.getJSONObject(i)), mt(7));
+    }
+
+    private View planCard(JSONObject p) {
+        LinearLayout card = card();
+        LinearLayout top = row();
+        top.addView(text(p.optString("title", "撮影計画"), 17, true), weight());
+        top.addView(statusBadge(p.optString("status", "PLANNED")), wrap());
+        card.addView(top);
+        TextView meta = text(p.optString("date", "日付未設定") + " • " + p.optString("spot", "スポット未指定") + " • P" + p.optInt("priority", 3), 11, false);
+        meta.setTextColor(muted());
+        card.addView(meta, mt(5));
+        addOptional(card, "SHOT", p.optString("shots", ""));
+        addOptional(card, "NARRATION", p.optString("narration", ""));
+        addOptional(card, "BGM", p.optString("bgm", ""));
+        LinearLayout buttons = row();
+        Button advance = mini("次の段階");
+        Button del = mini("削除");
+        buttons.addView(advance, weightMargin(6));
+        buttons.addView(del, weight());
+        card.addView(buttons, mt(10));
+        String id = p.optString("id");
+        advance.setOnClickListener(v -> mutate(() -> repo.setString(WorkspaceRepository.PLANS, id, "status", nextPlanStatus(p.optString("status", "PLANNED")))));
+        del.setOnClickListener(v -> confirmDelete("撮影計画", () -> repo.delete(WorkspaceRepository.PLANS, id)));
+        return card;
+    }
+
+    private View missionCard(JSONObject m) {
+        LinearLayout card = card();
+        LinearLayout top = row();
+        top.addView(text(m.optString("title", "ミッション"), 16, true), weight());
+        int progress = clamp(m.optInt("progress", 0), 0, 100);
+        top.addView(badge(progress + "%", progress >= 100 ? successSoft() : accentSoft(), progress >= 100 ? success() : accent()), wrap());
+        card.addView(top);
+        TextView meta = text("期限 " + m.optString("deadline", "なし") + " • 優先度 " + m.optInt("priority", 3) + "/5", 11, false);
+        meta.setTextColor(muted());
+        card.addView(meta, mt(5));
+        card.addView(progressBar(progress), mt(9));
+        addOptional(card, "OBJECTIVE", m.optString("objective", ""));
+        LinearLayout buttons = row();
+        Button plus = mini("+25%");
+        Button done = mini("完了");
+        Button del = mini("削除");
+        buttons.addView(plus, weightMargin(5));
+        buttons.addView(done, weightMargin(5));
+        buttons.addView(del, weight());
+        card.addView(buttons, mt(10));
+        String id = m.optString("id");
+        plus.setOnClickListener(v -> mutate(() -> repo.setInt(WorkspaceRepository.MISSIONS, id, "progress", clamp(progress + 25, 0, 100))));
+        done.setOnClickListener(v -> mutate(() -> repo.setInt(WorkspaceRepository.MISSIONS, id, "progress", 100)));
+        del.setOnClickListener(v -> confirmDelete("ミッション", () -> repo.delete(WorkspaceRepository.MISSIONS, id)));
+        return card;
+    }
+
+    private View gearCard(JSONObject g) {
+        LinearLayout card = card();
+        card.setPadding(dp(13), dp(12), dp(13), dp(12));
+        LinearLayout line = row();
+        CheckBox box = new CheckBox(this);
+        box.setChecked(g.optBoolean("packed", false));
+        box.setText(g.optString("name", "装備") + "  ×" + g.optInt("quantity", 1));
+        box.setTextColor(fg());
+        box.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        line.addView(box, weight());
+        Button del = mini("×");
+        line.addView(del, size(dp(52), dp(38)));
+        card.addView(line);
+        String id = g.optString("id");
+        box.setOnCheckedChangeListener((b, checked) -> mutate(() -> repo.setBoolean(WorkspaceRepository.GEAR, id, "packed", checked)));
+        del.setOnClickListener(v -> confirmDelete("装備", () -> repo.delete(WorkspaceRepository.GEAR, id)));
+        return card;
+    }
+
+    private void renderMedia() throws Exception {
+        pageRoot.addView(hero("MEDIA PIPELINE", "RAW → SELECT → EDIT → READY → PUBLISHED", "撮影素材を『撮った』で終わらせず、公開までの制作工程として追跡します。"));
+        LinearLayout stats = row();
+        stats.addView(stat("RAW", repo.countStatus(WorkspaceRepository.ASSETS, "stage", "RAW"), "素材"), weightMargin(6));
+        stats.addView(stat("EDIT", repo.countStatus(WorkspaceRepository.ASSETS, "stage", "EDIT"), "編集中"), weightMargin(6));
+        stats.addView(stat("PUBLISHED", repo.countStatus(WorkspaceRepository.ASSETS, "stage", "PUBLISHED"), "公開"), weight());
+        pageRoot.addView(stats, mt(12));
+        Button add = button("＋ 素材を登録", true);
+        pageRoot.addView(add, mt(16));
+        add.setOnClickListener(v -> showAssetDialog());
+        pageRoot.addView(section("ASSET LIBRARY", "制作ステージを進める"), mt(24));
+        List<JSONObject> assets = repo.recent(WorkspaceRepository.ASSETS, 80);
+        if (assets.isEmpty()) pageRoot.addView(empty("素材はまだ登録されていません。ファイル本体ではなく、素材の管理メタデータをVault内に保持します。"), mt(8));
+        for (JSONObject a : assets) pageRoot.addView(assetCard(a), mt(8));
+    }
+
+    private View assetCard(JSONObject a) {
+        LinearLayout card = card();
+        LinearLayout top = row();
+        top.addView(text(a.optString("name", "素材"), 17, true), weight());
+        top.addView(statusBadge(a.optString("stage", "RAW")), wrap());
+        card.addView(top);
+        TextView meta = text(a.optString("type", "VIDEO") + " • " + a.optString("spot", "場所未指定")
+                + (a.optString("duration", "").isEmpty() ? "" : " • " + a.optString("duration")), 11, false);
+        meta.setTextColor(muted());
+        card.addView(meta, mt(5));
+        addOptional(card, "REF", a.optString("reference", ""));
+        addOptional(card, "NOTE", a.optString("note", ""));
+        LinearLayout buttons = row();
+        Button next = mini("次工程");
+        Button del = mini("削除");
+        buttons.addView(next, weightMargin(6));
+        buttons.addView(del, weight());
+        card.addView(buttons, mt(10));
+        String id = a.optString("id");
+        next.setOnClickListener(v -> mutate(() -> repo.setString(WorkspaceRepository.ASSETS, id, "stage", nextMediaStage(a.optString("stage", "RAW")))));
+        del.setOnClickListener(v -> confirmDelete("素材", () -> repo.delete(WorkspaceRepository.ASSETS, id)));
+        return card;
+    }
+
+    private void renderAnalyze() throws Exception {
+        pageRoot.addView(hero("OPERATIONS ANALYTICS", "Offline Intelligence", "登録件数だけでなく、撮影準備・制作・候補地の偏りを可視化します。"));
+        JSONObject s = repo.summaryJson();
+        int operational = (s.optInt("planCompletion") + s.optInt("missionProgress") + s.optInt("mediaPublished") + s.optInt("gearReady")) / 4;
+        LinearLayout score = card();
+        TextView label = text("OPERATIONAL READINESS", 11, true);
+        label.setTextColor(muted());
+        score.addView(label);
+        TextView big = text(operational + " / 100", 36, true);
+        big.setTextColor(operational >= 75 ? success() : accent());
+        score.addView(big, mt(5));
+        score.addView(progressBar(operational), mt(8));
+        pageRoot.addView(score, mt(12));
+
+        pageRoot.addView(section("PIPELINE HEALTH", "主要KPI"), mt(24));
+        pageRoot.addView(progressCard("撮影計画完了", repo.planCompletionPercent(), "撮影計画のDONE比率"), mt(8));
+        pageRoot.addView(progressCard("ミッション平均", repo.missionAverageProgress(), "目標達成率"), mt(7));
+        pageRoot.addView(progressCard("公開素材", repo.mediaPublishedPercent(), "PUBLISHED比率"), mt(7));
+        pageRoot.addView(progressCard("装備準備", repo.gearReadyPercent(), "持ち出し準備率"), mt(7));
+
+        pageRoot.addView(section("CATEGORY MAP", "スポット構成"), mt(24));
+        Map<String, Integer> categories = repo.categoryCounts();
+        if (categories.isEmpty()) pageRoot.addView(empty("スポットカテゴリがまだありません。"), mt(8));
+        for (Map.Entry<String, Integer> e : categories.entrySet()) {
+            LinearLayout line = card();
+            line.setOrientation(LinearLayout.HORIZONTAL);
+            line.addView(text(e.getKey(), 14, true), weight());
+            line.addView(badge(String.valueOf(e.getValue()), accentSoft(), accent()), wrap());
+            pageRoot.addView(line, mt(6));
+        }
+
+        pageRoot.addView(section("TOP TARGETS", "撮影優先順位 Top 5"), mt(24));
+        List<WorkspaceRepository.Candidate> ranked = repo.rankedCandidates();
+        int limit = Math.min(5, ranked.size());
+        if (limit == 0) pageRoot.addView(empty("分析対象のスポットがありません。"), mt(8));
+        for (int i = 0; i < limit; i++) {
+            WorkspaceRepository.Candidate c = ranked.get(i);
+            LinearLayout line = card();
+            line.setOrientation(LinearLayout.HORIZONTAL);
+            TextView rank = badge("#" + (i + 1), surface2(), secondary());
+            line.addView(rank, size(dp(44), dp(38)));
+            LinearLayout info = column();
+            info.addView(text(c.spot.optString("title", "無題"), 14, true));
+            TextView sub = text(c.spot.optString("area", "") + " • " + c.spot.optString("category", "未分類"), 10, false);
+            sub.setTextColor(muted());
+            info.addView(sub);
+            LinearLayout.LayoutParams ip = weight(); ip.leftMargin = dp(10);
+            line.addView(info, ip);
+            line.addView(scoreBadge(c.score), wrap());
+            pageRoot.addView(line, mt(6));
+        }
+
+        pageRoot.addView(section("VAULT SCALE", "暗号化Workspace規模"), mt(24));
+        LinearLayout scale = card();
+        scale.addView(text("Schema v3 / " + repo.totalObjects() + " operational objects", 15, true));
+        TextView note = text("ログ・スポット・計画・ミッション・素材・装備を1つの認証付き暗号化Workspaceとして保存。", 12, false);
+        note.setTextColor(muted());
+        scale.addView(note, mt(6));
+        pageRoot.addView(scale, mt(8));
+    }
+
+    private void renderVault() throws Exception {
+        pageRoot.addView(hero("SECURITY VAULT", "Security Container Plant", "アプリ本体の大型化後も、すべてのWorkspaceデータは既存の暗号化・RASP・Triple Distribution Trust境界を通過します。"));
+        LinearLayout status = card();
+        LinearLayout top = row();
+        top.addView(text("Runtime Security", 18, true), weight());
+        top.addView(badge(vault.riskLevel() + " " + vault.riskScore(), vault.riskScore() >= 70 ? dangerSoft() : successSoft(), vault.riskScore() >= 70 ? danger() : success()), wrap());
+        status.addView(top);
+        TextView summary = text(vault.securitySummary(), 12, false);
+        summary.setTextColor(secondary());
+        status.addView(summary, mt(8));
+        TextView objects = text("Encrypted workspace objects: " + repo.totalObjects(), 12, true);
+        objects.setTextColor(accent());
+        status.addView(objects, mt(9));
+        pageRoot.addView(status, mt(12));
+
+        pageRoot.addView(section("ACCESS", "認証とセッション"), mt(24));
+        LinearLayout row = row();
+        Button pin = button(vault.hasPin() ? "PIN変更" : "PIN設定", false);
+        Button lock = button("今すぐロック", true);
+        row.addView(pin, weightMargin(7));
+        row.addView(lock, weight());
+        pageRoot.addView(row, mt(8));
+        pin.setOnClickListener(v -> showSetPinDialog());
+        lock.setOnClickListener(v -> {
+            if (!vault.hasPin()) showSetPinDialog();
+            else { unlocked = false; showLockScreen(); }
+        });
+
+        pageRoot.addView(section("ENCRYPTED BACKUP", ".tnvault Workspace export/import"), mt(24));
+        LinearLayout backup = row();
+        Button export = button("暗号化Export", false);
+        Button imp = button("暗号化Import", false);
+        backup.addView(export, weightMargin(7));
+        backup.addView(imp, weight());
+        pageRoot.addView(backup, mt(8));
+        export.setOnClickListener(v -> startExport());
+        imp.setOnClickListener(v -> startImport());
+
+        pageRoot.addView(section("DIAGNOSTICS", "サニタイズ済みセキュリティー状態"), mt(24));
+        TextView diag = text(vault.diagnosticsReport(), 11, false);
+        diag.setTextColor(secondary());
+        diag.setPadding(dp(14), dp(14), dp(14), dp(14));
+        diag.setBackground(round(surface(), dp(14), border()));
+        pageRoot.addView(diag, mt(8));
+    }
+
+    private void showSpotDialog() {
+        LinearLayout box = form();
+        EditText title = labeled(box, "スポット名", "例: 山間の旧道入口", false);
+        EditText area = labeled(box, "エリア", "市町村・地区・山域", false);
+        EditText category = labeled(box, "カテゴリ", "森 / 集落 / 川 / 廃道 / 山 / 海 など", false);
+        EditText tags = labeled(box, "タグ", "夕景, 自転車, 静寂", false);
+        EditText priority = labeled(box, "優先度 1〜5", "3", true);
+        EditText rating = labeled(box, "画の強さ 1〜5", "3", true);
+        EditText novelty = labeled(box, "新規性 1〜5", "3", true);
+        EditText access = labeled(box, "アクセス性 1〜5", "3", true);
+        EditText risk = labeled(box, "危険度 1〜5", "2", true);
+        EditText lat = labeled(box, "緯度メモ（任意）", "35.0000", false);
+        EditText lon = labeled(box, "経度メモ（任意）", "137.0000", false);
+        EditText note = labeled(box, "現地メモ", "光・音・道・時間帯・撮れ高など", false);
+        showFormDialog("新しい探索スポット", box, () -> {
+            if (title.getText().toString().trim().isEmpty()) throw new IllegalArgumentException("スポット名を入力してください");
+            JSONObject o = new JSONObject();
+            o.put("title", title.getText().toString().trim());
+            o.put("area", area.getText().toString().trim());
+            o.put("category", category.getText().toString().trim());
+            o.put("tags", tags.getText().toString().trim());
+            o.put("priority", number(priority, 3));
+            o.put("rating", number(rating, 3));
+            o.put("novelty", number(novelty, 3));
+            o.put("access", number(access, 3));
+            o.put("risk", number(risk, 2));
+            o.put("filmed", false);
+            o.put("favorite", false);
+            if (!lat.getText().toString().trim().isEmpty()) o.put("lat", lat.getText().toString().trim());
+            if (!lon.getText().toString().trim().isEmpty()) o.put("lon", lon.getText().toString().trim());
+            o.put("note", note.getText().toString().trim());
+            repo.add(WorkspaceRepository.SPOTS, o);
+        });
+    }
+
+    private void showLogDialog(JSONObject spot) {
+        LinearLayout box = form();
+        EditText title = labeled(box, "ログタイトル", spot == null ? "探索内容" : spot.optString("title"), false);
+        EditText place = labeled(box, "場所", spot == null ? "エリア" : spot.optString("area"), false);
+        EditText tags = labeled(box, "タグ", spot == null ? "" : spot.optString("tags"), false);
+        EditText memo = labeled(box, "記録", "現地状況・発見・撮影メモ", false);
+        CheckBox favorite = checkbox("お気に入り");
+        CheckBox filmed = checkbox("撮影済み");
+        box.addView(favorite, mt(8));
+        box.addView(filmed);
+        showFormDialog("探索ログ", box, () -> {
+            JSONObject o = new JSONObject();
+            o.put("title", title.getText().toString().trim().isEmpty() ? "探索ログ" : title.getText().toString().trim());
+            o.put("place", place.getText().toString().trim());
+            o.put("tags", tags.getText().toString().trim());
+            o.put("memo", memo.getText().toString().trim());
+            o.put("favorite", favorite.isChecked());
+            o.put("filmed", filmed.isChecked());
+            if (spot != null) o.put("spotId", spot.optString("id"));
+            repo.add(WorkspaceRepository.LOGS, o);
+        });
+    }
+
+    private void showPlanDialog(JSONObject spot) {
+        LinearLayout box = form();
+        EditText title = labeled(box, "企画・撮影名", spot == null ? "" : spot.optString("title") + " 撮影", false);
+        EditText spotName = labeled(box, "スポット", spot == null ? "" : spot.optString("title"), false);
+        EditText date = labeled(box, "予定日", new SimpleDateFormat("yyyy-MM-dd", Locale.JAPAN).format(new Date()), false);
+        EditText priority = labeled(box, "優先度 1〜5", "3", true);
+        EditText shots = labeled(box, "ショットリスト", "導入 / 歩行 / 引き / ディテール / 締め", false);
+        EditText narration = labeled(box, "ナレーション案", "ゆっくり解説の要点", false);
+        EditText bgm = labeled(box, "BGMムード", "静寂 / 不穏 / 爽快 / ノスタルジー", false);
+        showFormDialog("撮影計画を作成", box, () -> {
+            if (title.getText().toString().trim().isEmpty()) throw new IllegalArgumentException("撮影名を入力してください");
+            JSONObject o = new JSONObject();
+            o.put("title", title.getText().toString().trim());
+            o.put("spot", spotName.getText().toString().trim());
+            if (spot != null) o.put("spotId", spot.optString("id"));
+            o.put("date", date.getText().toString().trim());
+            o.put("priority", number(priority, 3));
+            o.put("shots", shots.getText().toString().trim());
+            o.put("narration", narration.getText().toString().trim());
+            o.put("bgm", bgm.getText().toString().trim());
+            o.put("status", "PLANNED");
+            repo.add(WorkspaceRepository.PLANS, o);
+        });
+    }
+
+    private void showMissionDialog() {
+        LinearLayout box = form();
+        EditText title = labeled(box, "ミッション", "例: 川沿いルートの撮影候補を3箇所調査", false);
+        EditText deadline = labeled(box, "期限", "yyyy-MM-dd または任意", false);
+        EditText priority = labeled(box, "優先度 1〜5", "3", true);
+        EditText objective = labeled(box, "完了条件", "何を達成したら100%か", false);
+        showFormDialog("ミッション追加", box, () -> {
+            if (title.getText().toString().trim().isEmpty()) throw new IllegalArgumentException("ミッション名を入力してください");
+            JSONObject o = new JSONObject();
+            o.put("title", title.getText().toString().trim());
+            o.put("deadline", deadline.getText().toString().trim());
+            o.put("priority", number(priority, 3));
+            o.put("objective", objective.getText().toString().trim());
+            o.put("progress", 0);
+            repo.add(WorkspaceRepository.MISSIONS, o);
+        });
+    }
+
+    private void showAssetDialog() {
+        LinearLayout box = form();
+        EditText name = labeled(box, "素材名", "例: 林道A7IV_001", false);
+        EditText type = labeled(box, "種類", "VIDEO / AUDIO / PHOTO / NARRATION", false);
+        EditText spot = labeled(box, "撮影スポット", "場所・企画", false);
+        EditText duration = labeled(box, "尺・長さ", "02:35 など", false);
+        EditText reference = labeled(box, "ファイル参照メモ", "SD1/DCIM/... 等（ファイル本体は保存しません）", false);
+        EditText note = labeled(box, "制作メモ", "採用候補・編集指示など", false);
+        showFormDialog("素材を登録", box, () -> {
+            if (name.getText().toString().trim().isEmpty()) throw new IllegalArgumentException("素材名を入力してください");
+            JSONObject o = new JSONObject();
+            o.put("name", name.getText().toString().trim());
+            o.put("type", type.getText().toString().trim().isEmpty() ? "VIDEO" : type.getText().toString().trim().toUpperCase(Locale.ROOT));
+            o.put("spot", spot.getText().toString().trim());
+            o.put("duration", duration.getText().toString().trim());
+            o.put("reference", reference.getText().toString().trim());
+            o.put("note", note.getText().toString().trim());
+            o.put("stage", "RAW");
+            repo.add(WorkspaceRepository.ASSETS, o);
+        });
+    }
+
+    private void showGearDialog() {
+        LinearLayout box = form();
+        EditText name = labeled(box, "装備名", "例: NDフィルター", false);
+        EditText qty = labeled(box, "数量", "1", true);
+        showFormDialog("装備を追加", box, () -> {
+            if (name.getText().toString().trim().isEmpty()) throw new IllegalArgumentException("装備名を入力してください");
+            JSONObject o = new JSONObject();
+            o.put("name", name.getText().toString().trim());
+            o.put("quantity", Math.max(1, number(qty, 1)));
+            o.put("packed", false);
+            repo.add(WorkspaceRepository.GEAR, o);
+        });
+    }
+
+    private interface ThrowingAction { void run() throws Exception; }
+
+    private void showFormDialog(String title, LinearLayout box, ThrowingAction action) {
+        ScrollView scroll = new ScrollView(this);
+        scroll.addView(box);
         AlertDialog dialog = new AlertDialog.Builder(this)
-                .setTitle(changing ? "PINを変更" : "PINを設定")
-                .setMessage("PINそのものは保存せず、PBKDF2-SHA256で検証値のみを保存します。")
-                .setView(box)
+                .setTitle(title)
+                .setView(scroll)
                 .setNegativeButton("キャンセル", null)
                 .setPositiveButton("保存", null)
                 .create();
         dialog.setOnShowListener(x -> dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
             try {
-                if (changing && !vault.verifyPin(currentFinal.getText().toString())) {
-                    toast("現在のPINが違います");
-                    return;
-                }
-                String a = next.getText().toString();
-                String b = confirm.getText().toString();
-                if (!a.equals(b)) {
-                    toast("新しいPINが一致しません");
-                    return;
-                }
-                vault.setPin(a);
-                refreshSecurityStatus();
+                action.run();
                 dialog.dismiss();
-                toast(changing ? "PINを変更しました" : "PINロックを有効にしました");
+                renderPage();
+                toast("保存しました");
             } catch (Exception e) {
-                toast(e.getMessage() == null ? "PIN設定に失敗しました" : e.getMessage());
+                toast(safeMessage(e));
             }
         }));
         dialog.show();
     }
 
-    private void buildUi() {
-        ScrollView scroll = new ScrollView(this);
-        scroll.setFillViewport(true);
-        scroll.setClipToPadding(false);
-        scroll.setBackgroundColor(bg());
-
-        LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(dp(16), dp(14), dp(16), dp(42));
-        scroll.addView(root, new ScrollView.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-
-        root.addView(buildHero());
-        root.addView(buildStats(), topMargin(12));
-
-        root.addView(sectionHeader("SECURITY", "TrailNote Vault"), topMargin(28));
-        root.addView(buildSecurityCard(), topMargin(10));
-
-        root.addView(sectionHeader("LOG EDITOR", "探索ログを追加・編集"), topMargin(28));
-        root.addView(buildEditorCard(), topMargin(10));
-
-        root.addView(sectionHeader("LIBRARY", "記録を探す・絞り込む"), topMargin(28));
-        root.addView(buildSearchCard(), topMargin(10));
-
-        LinearLayout listHeader = new LinearLayout(this);
-        listHeader.setOrientation(LinearLayout.HORIZONTAL);
-        listHeader.setGravity(Gravity.CENTER_VERTICAL);
-        TextView listTitle = text("探索ログ", 20, true);
-        listHeader.addView(listTitle, weight());
-        resultsLabel = text("0件", 13, true);
-        resultsLabel.setTextColor(accent());
-        resultsLabel.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
-        listHeader.addView(resultsLabel, wrap());
-        root.addView(listHeader, topMargin(24));
-
-        listContainer = new LinearLayout(this);
-        listContainer.setOrientation(LinearLayout.VERTICAL);
-        root.addView(listContainer, topMargin(4));
-
-        LinearLayout privacyCard = panel(dp(14), surface2(), false);
-        privacyCard.setGravity(Gravity.CENTER_HORIZONTAL);
-        TextView privacyTitle = text("LOCAL ENCRYPTED VAULT", 11, true);
-        privacyTitle.setTextColor(accent());
-        privacyTitle.setLetterSpacing(0.11f);
-        privacyTitle.setGravity(Gravity.CENTER);
-        privacyCard.addView(privacyTitle);
-        TextView privacy = text("通信権限なし・位置情報権限なし・画面キャプチャ防止", 12, false);
-        privacy.setTextColor(muted());
-        privacy.setGravity(Gravity.CENTER);
-        privacyCard.addView(privacy, topMargin(5));
-        root.addView(privacyCard, topMargin(26));
-
-        setContentView(scroll);
-    }
-
-    private View buildHero() {
-        LinearLayout hero = panel(dp(20), heroBg(), true);
-        hero.setPadding(dp(20), dp(20), dp(20), dp(20));
-
-        LinearLayout top = new LinearLayout(this);
-        top.setOrientation(LinearLayout.HORIZONTAL);
-        top.setGravity(Gravity.CENTER_VERTICAL);
-
-        TextView mark = text("TN", 16, true);
-        mark.setGravity(Gravity.CENTER);
-        mark.setTextColor(Color.WHITE);
-        mark.setBackground(round(accent(), dp(14), 0, Color.TRANSPARENT));
-        top.addView(mark, new LinearLayout.LayoutParams(dp(48), dp(48)));
-
-        LinearLayout titles = new LinearLayout(this);
-        titles.setOrientation(LinearLayout.VERTICAL);
-        TextView brand = text("TrailNote", 29, true);
-        brand.setLetterSpacing(-0.02f);
-        titles.addView(brand);
-        TextView tagline = text("Explore. Capture. Protect.", 13, false);
-        tagline.setTextColor(muted());
-        titles.addView(tagline, topMargin(1));
-        LinearLayout.LayoutParams tp = weight();
-        tp.leftMargin = dp(14);
-        top.addView(titles, tp);
-        hero.addView(top);
-
-        TextView lead = text("森・田舎・撮影スポットを、暗号化された自分だけの探索ライブラリに。", 15, false);
-        lead.setTextColor(fg());
-        lead.setLineSpacing(0, 1.2f);
-        hero.addView(lead, topMargin(18));
-
-        TextView badge = text("●  KEYSTORE ENCRYPTED", 11, true);
-        badge.setTextColor(accent());
-        badge.setPadding(dp(10), dp(6), dp(10), dp(6));
-        badge.setBackground(round(accentSoft(), dp(20), 0, Color.TRANSPARENT));
-        LinearLayout.LayoutParams bp = wrap();
-        bp.topMargin = dp(14);
-        hero.addView(badge, bp);
-        return hero;
-    }
-
-    private View buildStats() {
-        LinearLayout row = new LinearLayout(this);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-
-        StatBlock total = statBlock("TOTAL", "0", "記録");
-        totalValue = total.value;
-        row.addView(total.root, weightWithRight(8));
-
-        StatBlock fav = statBlock("FAVORITE", "0", "お気に入り");
-        favoriteValue = fav.value;
-        row.addView(fav.root, weightWithRight(8));
-
-        StatBlock filmed = statBlock("FILMED", "0", "撮影済み");
-        filmedValue = filmed.value;
-        row.addView(filmed.root, weight());
-        return row;
-    }
-
-    private View buildSecurityCard() {
-        LinearLayout card = panel(dp(18), cardBg(), true);
-        card.setPadding(dp(16), dp(16), dp(16), dp(16));
-
-        LinearLayout header = new LinearLayout(this);
-        header.setOrientation(LinearLayout.HORIZONTAL);
-        header.setGravity(Gravity.CENTER_VERTICAL);
-        TextView title = text("独立ローカルセキュリティー", 16, true);
-        header.addView(title, weight());
-        securityStatus = text("", 11, true);
-        securityStatus.setPadding(dp(9), dp(5), dp(9), dp(5));
-        header.addView(securityStatus, wrap());
-        card.addView(header);
-
-        TextView crypto = text(vault.securitySummary(), 12, false);
-        crypto.setTextColor(muted());
-        card.addView(crypto, topMargin(7));
-
-        TextView protection = text("ログ本体を暗号化保存 / 画面キャプチャ防止 / PIN失敗ロックアウト / 30秒自動再ロック", 13, false);
-        protection.setTextColor(secondaryText());
-        protection.setLineSpacing(0, 1.15f);
-        card.addView(protection, topMargin(8));
-
-        LinearLayout buttons = new LinearLayout(this);
-        buttons.setOrientation(LinearLayout.HORIZONTAL);
-        Button pinBtn = actionButton(vault.hasPin() ? "PIN変更" : "PIN設定", ButtonStyle.SECONDARY);
-        Button lockBtn = actionButton("今すぐロック", ButtonStyle.SECONDARY);
-        buttons.addView(pinBtn, weightWithRight(8));
-        buttons.addView(lockBtn, weight());
-        card.addView(buttons, topMargin(12));
-        pinBtn.setOnClickListener(v -> showSetPinDialog());
-        lockBtn.setOnClickListener(v -> {
-            if (!vault.hasPin()) {
-                showSetPinDialog();
-                return;
-            }
-            unlocked = false;
-            showLockScreen();
-        });
-
-        TextView backupLabel = text("ENCRYPTED BACKUP", 10, true);
-        backupLabel.setTextColor(muted());
-        backupLabel.setLetterSpacing(0.10f);
-        card.addView(backupLabel, topMargin(14));
-
-        LinearLayout backup = new LinearLayout(this);
-        backup.setOrientation(LinearLayout.HORIZONTAL);
-        Button exportBtn = actionButton("暗号化書き出し", ButtonStyle.SECONDARY);
-        Button importBtn = actionButton("暗号化復元", ButtonStyle.SECONDARY);
-        backup.addView(exportBtn, weightWithRight(8));
-        backup.addView(importBtn, weight());
-        card.addView(backup, topMargin(6));
-        exportBtn.setOnClickListener(v -> requestEncryptedExport());
-        importBtn.setOnClickListener(v -> requestEncryptedImport());
-
-        refreshSecurityStatus();
-        return card;
-    }
-
-    private void refreshSecurityStatus() {
-        if (securityStatus == null) return;
-        boolean pin = vault.hasPin();
-        securityStatus.setText(pin ? "LOCK ON" : "ENCRYPTED");
-        securityStatus.setTextColor(pin ? success() : accent());
-        securityStatus.setBackground(round(pin ? successSoft() : accentSoft(), dp(15), 0, Color.TRANSPARENT));
-    }
-
-    private View buildEditorCard() {
-        LinearLayout card = panel(dp(18), cardBg(), true);
-        card.setPadding(dp(16), dp(16), dp(16), dp(16));
-
-        LinearLayout mode = new LinearLayout(this);
-        mode.setOrientation(LinearLayout.HORIZONTAL);
-        mode.setGravity(Gravity.CENTER_VERTICAL);
-        TextView modeTitle = text("記録内容", 17, true);
-        mode.addView(modeTitle, weight());
-        formModeLabel = text("新規作成", 12, true);
-        formModeLabel.setTextColor(accent());
-        formModeLabel.setPadding(dp(9), dp(5), dp(9), dp(5));
-        formModeLabel.setBackground(round(accentSoft(), dp(16), 0, Color.TRANSPARENT));
-        mode.addView(formModeLabel, wrap());
-        card.addView(mode);
-
-        card.addView(fieldLabel("タイトル", true), topMargin(16));
-        titleInput = edit("例：旧林道の夕景スポット", false);
-        card.addView(titleInput, topMargin(6));
-
-        card.addView(fieldLabel("場所・エリア", false), topMargin(13));
-        placeInput = edit("例：○○市 北部林道", false);
-        card.addView(placeInput, topMargin(6));
-
-        card.addView(fieldLabel("タグ", false), topMargin(13));
-        tagsInput = edit("森, 廃道, 夕景", false);
-        card.addView(tagsInput, topMargin(6));
-
-        card.addView(fieldLabel("撮影メモ", false), topMargin(13));
-        memoInput = edit("ルート、光の向き、危険箇所、次回撮りたいカットなど", true);
-        card.addView(memoInput, topMargin(6));
-
-        LinearLayout checks = new LinearLayout(this);
-        checks.setOrientation(LinearLayout.HORIZONTAL);
-        favoriteInput = check("★ お気に入り");
-        filmedInput = check("✓ 撮影済み");
-        checks.addView(favoriteInput, weightWithRight(4));
-        checks.addView(filmedInput, weight());
-        card.addView(checks, topMargin(10));
-
-        Button saveBtn = actionButton("暗号化して保存", ButtonStyle.PRIMARY);
-        card.addView(saveBtn, topMargin(12));
-        saveBtn.setOnClickListener(v -> saveEntry());
-
-        LinearLayout secondaryActions = new LinearLayout(this);
-        secondaryActions.setOrientation(LinearLayout.HORIZONTAL);
-        Button newBtn = actionButton("新規に戻す", ButtonStyle.SECONDARY);
-        Button deleteBtn = actionButton("削除", ButtonStyle.DANGER_GHOST);
-        secondaryActions.addView(newBtn, weightWithRight(8));
-        secondaryActions.addView(deleteBtn, weight());
-        card.addView(secondaryActions, topMargin(8));
-        newBtn.setOnClickListener(v -> clearForm());
-        deleteBtn.setOnClickListener(v -> confirmDelete());
-        return card;
-    }
-
-    private View buildSearchCard() {
-        LinearLayout card = panel(dp(18), cardBg(), true);
-        card.setPadding(dp(16), dp(16), dp(16), dp(16));
-
-        searchInput = edit("検索：タイトル / 場所 / タグ / メモ", false);
-        card.addView(searchInput);
-        favoriteOnly = check("★ お気に入りだけ表示");
-        card.addView(favoriteOnly, topMargin(6));
-
-        filterStatus = text("表示: すべて • 新しい順", 12, true);
-        filterStatus.setTextColor(accent());
-        card.addView(filterStatus, topMargin(6));
-
-        LinearLayout filters = new LinearLayout(this);
-        filters.setOrientation(LinearLayout.HORIZONTAL);
-        Button stateBtn = actionButton("状態フィルタ", ButtonStyle.SECONDARY);
-        Button sortBtn = actionButton("並び替え", ButtonStyle.SECONDARY);
-        filters.addView(stateBtn, weightWithRight(8));
-        filters.addView(sortBtn, weight());
-        card.addView(filters, topMargin(8));
-
-        Button nextBtn = actionButton("🎯 次に撮る候補をランダム選択", ButtonStyle.PRIMARY);
-        card.addView(nextBtn, topMargin(8));
-
-        searchInput.addTextChangedListener(new TextWatcher() {
-            @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
-            @Override public void onTextChanged(CharSequence s, int start, int before, int count) { render(); }
-            @Override public void afterTextChanged(Editable s) {}
-        });
-        favoriteOnly.setOnCheckedChangeListener((buttonView, isChecked) -> render());
-        stateBtn.setOnClickListener(v -> {
-            filterMode = (filterMode + 1) % 3;
-            updateFilterStatus();
-            render();
-        });
-        sortBtn.setOnClickListener(v -> {
-            sortNewest = !sortNewest;
-            updateFilterStatus();
-            render();
-        });
-        nextBtn.setOnClickListener(v -> pickNextToShoot());
-
-        return card;
-    }
-
-    private void updateFilterStatus() {
-        if (filterStatus == null) return;
-        String state = filterMode == 1 ? "未撮影" : filterMode == 2 ? "撮影済み" : "すべて";
-        filterStatus.setText("表示: " + state + " • " + (sortNewest ? "新しい順" : "古い順"));
-    }
-
-    private void pickNextToShoot() {
+    private void showSearchResults(String query) {
         try {
-            JSONArray all = load();
-            ArrayList<JSONObject> candidates = new ArrayList<>();
-            for (int i = 0; i < all.length(); i++) {
-                JSONObject o = all.optJSONObject(i);
-                if (o != null && !o.optBoolean("filmed")) candidates.add(o);
+            List<WorkspaceRepository.SearchHit> hits = repo.search(query);
+            LinearLayout box = form();
+            if (hits.isEmpty()) box.addView(text("一致するデータはありません。", 13, false));
+            for (WorkspaceRepository.SearchHit h : hits) {
+                LinearLayout line = card();
+                line.addView(badge(h.type, surface2(), accent()));
+                line.addView(text(h.title, 15, true), mt(7));
+                TextView sub = text(h.subtitle, 11, false);
+                sub.setTextColor(muted());
+                line.addView(sub, mt(3));
+                box.addView(line, mt(6));
             }
-            if (candidates.isEmpty()) {
-                toast("未撮影の候補がありません");
-                return;
-            }
-            JSONObject pick = candidates.get(new Random().nextInt(candidates.size()));
-            selectEntry(pick);
-            toast("次の候補: " + pick.optString("title", "無題"));
+            ScrollView scroll = new ScrollView(this); scroll.addView(box);
+            new AlertDialog.Builder(this).setTitle("Workspace検索 • " + hits.size() + "件").setView(scroll).setPositiveButton("閉じる", null).show();
         } catch (Exception e) {
-            toast("候補選択に失敗しました");
+            toast("検索失敗: " + safeMessage(e));
         }
     }
 
-    private void saveEntry() {
-        String title = titleInput.getText().toString().trim();
-        if (title.isEmpty()) {
-            toast("タイトルを入力してください");
-            return;
-        }
-        try {
-            JSONArray all = load();
-            JSONObject target = null;
-            boolean isNew = selectedId == null;
-            if (!isNew) target = findById(all, selectedId);
-            if (target == null) {
-                target = new JSONObject();
-                selectedId = UUID.randomUUID().toString();
-                target.put("id", selectedId);
-                target.put("createdAt", System.currentTimeMillis());
-                all.put(target);
-                isNew = true;
-            }
-            target.put("title", title);
-            target.put("place", placeInput.getText().toString().trim());
-            target.put("tags", tagsInput.getText().toString().trim());
-            target.put("memo", memoInput.getText().toString().trim());
-            target.put("favorite", favoriteInput.isChecked());
-            target.put("filmed", filmedInput.isChecked());
-            target.put("updatedAt", System.currentTimeMillis());
-            persist(all);
-            updateFormMode();
-            render();
-            toast(isNew ? "暗号化して保存しました" : "暗号化データを更新しました");
-        } catch (Exception e) {
-            toast("保存に失敗しました: " + e.getMessage());
-        }
-    }
-
-    private void confirmDelete() {
-        if (selectedId == null) {
-            toast("削除する記録を一覧から選択してください");
-            return;
-        }
+    private void showFirstRunSecuritySetup() {
         new AlertDialog.Builder(this)
-                .setTitle("この探索ログを削除しますか？")
-                .setMessage("この操作は元に戻せません。")
-                .setNegativeButton("キャンセル", null)
-                .setPositiveButton("削除", (d, which) -> deleteSelected())
+                .setTitle("TrailNote Vault")
+                .setMessage("v3 WorkspaceはAndroid Keystoreで暗号化されています。PINを設定すると、PIN由来鍵との二重鍵保護と自動ロックも有効になります。")
+                .setNegativeButton("あとで", null)
+                .setPositiveButton("PIN設定", (d, w) -> showSetPinDialog())
                 .show();
     }
 
-    private void deleteSelected() {
-        try {
-            JSONArray all = load();
-            for (int i = 0; i < all.length(); i++) {
-                JSONObject o = all.optJSONObject(i);
-                if (o != null && selectedId.equals(o.optString("id"))) {
-                    all.remove(i);
-                    break;
-                }
-            }
-            persist(all);
-            clearForm();
-            render();
-            toast("削除しました");
-        } catch (Exception e) {
-            toast("削除に失敗しました");
-        }
-    }
-
-    private void toggleFavorite(String id) {
-        try {
-            JSONArray all = load();
-            JSONObject o = findById(all, id);
-            if (o == null) return;
-            o.put("favorite", !o.optBoolean("favorite"));
-            o.put("updatedAt", System.currentTimeMillis());
-            persist(all);
-            render();
-        } catch (Exception e) {
-            toast("更新に失敗しました");
-        }
-    }
-
-    private void toggleFilmed(String id) {
-        try {
-            JSONArray all = load();
-            JSONObject o = findById(all, id);
-            if (o == null) return;
-            o.put("filmed", !o.optBoolean("filmed"));
-            o.put("updatedAt", System.currentTimeMillis());
-            persist(all);
-            if (id.equals(selectedId)) filmedInput.setChecked(o.optBoolean("filmed"));
-            render();
-        } catch (Exception e) {
-            toast("更新に失敗しました");
-        }
-    }
-
-    private void duplicateEntry(String id) {
-        try {
-            JSONArray all = load();
-            JSONObject src = findById(all, id);
-            if (src == null) return;
-            JSONObject copy = new JSONObject();
-            copy.put("id", UUID.randomUUID().toString());
-            copy.put("title", src.optString("title") + "（コピー）");
-            copy.put("place", src.optString("place"));
-            copy.put("tags", src.optString("tags"));
-            copy.put("memo", src.optString("memo"));
-            copy.put("favorite", src.optBoolean("favorite"));
-            copy.put("filmed", false);
-            copy.put("createdAt", System.currentTimeMillis());
-            copy.put("updatedAt", System.currentTimeMillis());
-            all.put(copy);
-            persist(all);
-            render();
-            toast("複製しました");
-        } catch (Exception e) {
-            toast("複製に失敗しました");
-        }
-    }
-
-    private void clearForm() {
-        selectedId = null;
-        titleInput.setText("");
-        placeInput.setText("");
-        tagsInput.setText("");
-        memoInput.setText("");
-        favoriteInput.setChecked(false);
-        filmedInput.setChecked(false);
-        updateFormMode();
-        render();
-    }
-
-    private void selectEntry(JSONObject o) {
-        selectedId = o.optString("id", null);
-        titleInput.setText(o.optString("title"));
-        placeInput.setText(o.optString("place"));
-        tagsInput.setText(o.optString("tags"));
-        memoInput.setText(o.optString("memo"));
-        favoriteInput.setChecked(o.optBoolean("favorite"));
-        filmedInput.setChecked(o.optBoolean("filmed"));
-        updateFormMode();
-        render();
-    }
-
-    private void updateFormMode() {
-        if (formModeLabel == null) return;
-        formModeLabel.setText(selectedId == null ? "新規作成" : "編集中");
-        formModeLabel.setTextColor(selectedId == null ? accent() : selectedAccent());
-        formModeLabel.setBackground(round(selectedId == null ? accentSoft() : selectedSoft(), dp(16), 0, Color.TRANSPARENT));
-    }
-
-    private void render() {
-        if (listContainer == null) return;
-        try {
-            JSONArray all = load();
-            int fav = 0, filmed = 0;
-            for (int i = 0; i < all.length(); i++) {
-                JSONObject o = all.optJSONObject(i);
-                if (o == null) continue;
-                if (o.optBoolean("favorite")) fav++;
-                if (o.optBoolean("filmed")) filmed++;
-            }
-            totalValue.setText(String.valueOf(all.length()));
-            favoriteValue.setText(String.valueOf(fav));
-            filmedValue.setText(String.valueOf(filmed));
-
-            listContainer.removeAllViews();
-            String q = searchInput == null ? "" : searchInput.getText().toString().trim().toLowerCase(Locale.ROOT);
-            boolean favOnly = favoriteOnly != null && favoriteOnly.isChecked();
-            int shown = 0;
-
-            int start = sortNewest ? all.length() - 1 : 0;
-            int end = sortNewest ? -1 : all.length();
-            int step = sortNewest ? -1 : 1;
-            for (int i = start; i != end; i += step) {
-                JSONObject o = all.optJSONObject(i);
-                if (o == null) continue;
-                if (favOnly && !o.optBoolean("favorite")) continue;
-                if (filterMode == 1 && o.optBoolean("filmed")) continue;
-                if (filterMode == 2 && !o.optBoolean("filmed")) continue;
-                String hay = (o.optString("title") + " " + o.optString("place") + " "
-                        + o.optString("tags") + " " + o.optString("memo")).toLowerCase(Locale.ROOT);
-                if (!q.isEmpty() && !hay.contains(q)) continue;
-                listContainer.addView(entryCard(o), topMargin(10));
-                shown++;
-            }
-            resultsLabel.setText(shown + "件");
-            updateFilterStatus();
-            if (shown == 0) listContainer.addView(emptyState(all.length() == 0), topMargin(10));
-        } catch (Exception e) {
-            resultsLabel.setText("エラー");
-        }
-    }
-
-    private View entryCard(JSONObject o) {
-        boolean selected = selectedId != null && selectedId.equals(o.optString("id"));
-        boolean filmed = o.optBoolean("filmed");
-        boolean favorite = o.optBoolean("favorite");
-        String id = o.optString("id");
-
-        LinearLayout outer = new LinearLayout(this);
-        outer.setOrientation(LinearLayout.HORIZONTAL);
-        outer.setBackground(round(selected ? selectedCardBg() : cardBg(), dp(18), dp(1), selected ? selectedAccent() : border()));
-        outer.setElevation(dp(selected ? 4 : 2));
-
-        View accentBar = new View(this);
-        accentBar.setBackground(round(favorite ? accent() : (filmed ? success() : border()), dp(12), 0, Color.TRANSPARENT));
-        LinearLayout.LayoutParams barParams = new LinearLayout.LayoutParams(dp(5), ViewGroup.LayoutParams.MATCH_PARENT);
-        barParams.leftMargin = dp(8);
-        barParams.topMargin = dp(10);
-        barParams.bottomMargin = dp(10);
-        outer.addView(accentBar, barParams);
-
-        LinearLayout content = new LinearLayout(this);
-        content.setOrientation(LinearLayout.VERTICAL);
-        content.setPadding(dp(13), dp(14), dp(14), dp(14));
-        outer.addView(content, weight());
-
-        LinearLayout titleRow = new LinearLayout(this);
-        titleRow.setOrientation(LinearLayout.HORIZONTAL);
-        titleRow.setGravity(Gravity.CENTER_VERTICAL);
-        TextView title = text((favorite ? "★ " : "") + o.optString("title", "無題"), 18, true);
-        title.setMaxLines(2);
-        titleRow.addView(title, weight());
-
-        TextView state = text(filmed ? "撮影済み" : "未撮影", 11, true);
-        state.setTextColor(filmed ? success() : muted());
-        state.setPadding(dp(9), dp(5), dp(9), dp(5));
-        state.setBackground(round(filmed ? successSoft() : surface2(), dp(14), 0, Color.TRANSPARENT));
-        LinearLayout.LayoutParams stateParams = wrap();
-        stateParams.leftMargin = dp(8);
-        titleRow.addView(state, stateParams);
-        content.addView(titleRow);
-
-        String place = o.optString("place");
-        long created = o.optLong("createdAt", 0L);
-        String meta = format(created);
-        if (!place.isEmpty()) meta += "  ·  " + place;
-        TextView metaView = text(meta, 12, false);
-        metaView.setTextColor(muted());
-        content.addView(metaView, topMargin(6));
-
-        String tags = o.optString("tags");
-        if (!tags.trim().isEmpty()) content.addView(tagRow(tags), topMargin(9));
-
-        String memo = o.optString("memo");
-        if (!memo.isEmpty()) {
-            TextView memoView = text(memo.length() > 180 ? memo.substring(0, 180) + "…" : memo, 14, false);
-            memoView.setTextColor(secondaryText());
-            memoView.setLineSpacing(0, 1.15f);
-            content.addView(memoView, topMargin(10));
-        }
-
-        LinearLayout quick = new LinearLayout(this);
-        quick.setOrientation(LinearLayout.HORIZONTAL);
-        Button favBtn = miniButton(favorite ? "★解除" : "★追加");
-        Button filmBtn = miniButton(filmed ? "未撮影へ" : "撮影済み");
-        Button copyBtn = miniButton("複製");
-        quick.addView(favBtn, weightWithRight(6));
-        quick.addView(filmBtn, weightWithRight(6));
-        quick.addView(copyBtn, weight());
-        content.addView(quick, topMargin(11));
-        favBtn.setOnClickListener(v -> toggleFavorite(id));
-        filmBtn.setOnClickListener(v -> toggleFilmed(id));
-        copyBtn.setOnClickListener(v -> duplicateEntry(id));
-
-        TextView hint = text(selected ? "● 編集中" : "カード本体をタップして編集", 11, true);
-        hint.setTextColor(selected ? selectedAccent() : muted());
-        content.addView(hint, topMargin(9));
-
-        outer.setOnClickListener(v -> selectEntry(o));
-        return outer;
-    }
-
-    private View tagRow(String raw) {
-        LinearLayout row = new LinearLayout(this);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        String[] parts = raw.split(",");
-        int added = 0;
-        for (String p : parts) {
-            String t = p.trim();
-            if (t.isEmpty()) continue;
-            if (added >= 4) break;
-            TextView chip = text("#" + t, 11, true);
-            chip.setTextColor(accent());
-            chip.setPadding(dp(8), dp(4), dp(8), dp(4));
-            chip.setBackground(round(accentSoft(), dp(13), 0, Color.TRANSPARENT));
-            LinearLayout.LayoutParams cp = wrap();
-            if (added > 0) cp.leftMargin = dp(6);
-            row.addView(chip, cp);
-            added++;
-        }
-        if (parts.length > 4) {
-            TextView more = text("+" + (parts.length - 4), 11, true);
-            more.setTextColor(muted());
-            LinearLayout.LayoutParams mp = wrap();
-            mp.leftMargin = dp(6);
-            row.addView(more, mp);
-        }
-        return row;
-    }
-
-    private View emptyState(boolean trulyEmpty) {
-        LinearLayout empty = panel(dp(18), cardBg(), false);
-        empty.setGravity(Gravity.CENTER_HORIZONTAL);
-        empty.setPadding(dp(20), dp(28), dp(20), dp(28));
-        TextView icon = text(trulyEmpty ? "＋" : "⌕", 26, true);
-        icon.setGravity(Gravity.CENTER);
-        icon.setTextColor(accent());
-        empty.addView(icon);
-        TextView title = text(trulyEmpty ? "最初の探索ログを作ろう" : "一致する記録がありません", 16, true);
-        title.setGravity(Gravity.CENTER);
-        empty.addView(title, topMargin(8));
-        TextView desc = text(trulyEmpty ? "上のフォームから暗号化して保存できます。" : "検索ワードやフィルターを変えてみてください。", 13, false);
-        desc.setTextColor(muted());
-        desc.setGravity(Gravity.CENTER);
-        empty.addView(desc, topMargin(4));
-        return empty;
-    }
-
-    private JSONArray load() {
-        try {
-            JSONArray result = new JSONArray(vault.loadEntries(prefs, KEY_ENTRIES));
-            vaultReadError = false;
-            return result;
-        } catch (Exception e) {
-            vaultReadError = true;
-            return new JSONArray();
-        }
-    }
-
-    private void persist(JSONArray all) throws Exception {
-        if (vaultReadError) {
-            throw new SecurityException("Vault integrity/read error: refusing to overwrite protected data");
-        }
-        vault.saveEntries(all.toString());
-    }
-
-    private JSONObject findById(JSONArray all, String id) {
-        for (int i = 0; i < all.length(); i++) {
-            JSONObject o = all.optJSONObject(i);
-            if (o != null && id.equals(o.optString("id"))) return o;
-        }
-        return null;
-    }
-
-    private void requestEncryptedExport() {
-        LinearLayout box = new LinearLayout(this);
-        box.setOrientation(LinearLayout.VERTICAL);
-        box.setPadding(dp(20), dp(8), dp(20), 0);
-        EditText a = passwordEdit("パスフレーズ（8文字以上）");
-        EditText b = passwordEdit("パスフレーズを再入力");
-        box.addView(a, topMargin(6));
-        box.addView(b, topMargin(10));
-
-        AlertDialog dialog = new AlertDialog.Builder(this)
-                .setTitle("暗号化バックアップ")
-                .setMessage("バックアップ専用のパスフレーズでAES-256-GCM暗号化します。PINとは別にできます。")
-                .setView(box)
-                .setNegativeButton("キャンセル", null)
-                .setPositiveButton("書き出す", null)
-                .create();
-        dialog.setOnShowListener(x -> dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
-            String p1 = a.getText().toString();
-            if (p1.length() < 8) {
-                toast("8文字以上にしてください");
-                return;
-            }
-            if (!p1.equals(b.getText().toString())) {
-                toast("パスフレーズが一致しません");
-                return;
-            }
-            pendingBackupPassphrase = p1;
-            Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
-            intent.setType("application/octet-stream");
-            intent.putExtra(Intent.EXTRA_TITLE, "trailnote-backup.tnvault");
-            startActivityForResult(intent, REQ_EXPORT_VAULT);
-            dialog.dismiss();
-        }));
-        dialog.show();
-    }
-
-    private void requestEncryptedImport() {
-        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
-        intent.setType("*/*");
-        intent.addCategory(Intent.CATEGORY_OPENABLE);
-        startActivityForResult(intent, REQ_IMPORT_VAULT);
-    }
-
-    private void showImportPassphraseDialog(String raw) {
-        EditText pass = passwordEdit("バックアップのパスフレーズ");
-        LinearLayout box = new LinearLayout(this);
-        box.setOrientation(LinearLayout.VERTICAL);
-        box.setPadding(dp(20), dp(8), dp(20), 0);
-        box.addView(pass);
-
-        AlertDialog dialog = new AlertDialog.Builder(this)
-                .setTitle("暗号化バックアップを復元")
-                .setMessage("正しいパスフレーズを入力してください。")
-                .setView(box)
-                .setNegativeButton("キャンセル", null)
-                .setPositiveButton("復元", null)
-                .create();
+    private void showSetPinDialog() {
+        boolean changing = vault.hasPin();
+        LinearLayout box = form();
+        EditText current = null;
+        if (changing) current = labeled(box, "現在のPIN", "6〜12桁", true);
+        EditText next = labeled(box, "新しいPIN", "6〜12桁", true);
+        EditText confirm = labeled(box, "確認", "もう一度入力", true);
+        final EditText currentFinal = current;
+        AlertDialog dialog = new AlertDialog.Builder(this).setTitle(changing ? "PIN変更" : "PIN設定")
+                .setView(box).setNegativeButton("キャンセル", null).setPositiveButton("保存", null).create();
         dialog.setOnShowListener(x -> dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
             try {
-                String plain = vault.decryptBackup(raw, pass.getText().toString());
-                JSONArray parsed = new JSONArray(plain);
-                persist(parsed);
-                clearForm();
-                render();
+                if (changing && !vault.verifyPin(currentFinal.getText().toString())) { toast("現在のPINが違います"); return; }
+                String a = next.getText().toString();
+                if (!a.equals(confirm.getText().toString())) { toast("PINが一致しません"); return; }
+                vault.setPin(a);
                 dialog.dismiss();
-                toast("暗号化バックアップを復元しました");
-            } catch (Exception e) {
-                toast("復元できません。パスフレーズまたはファイルを確認してください");
-            }
+                renderPage();
+                toast("PINを更新しました");
+            } catch (Exception e) { toast(safeMessage(e)); }
         }));
         dialog.show();
+    }
+
+    private void startExport() {
+        askPassphrase("暗号化Export", true, pass -> {
+            pendingExportPassphrase = pass;
+            Intent i = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+            i.addCategory(Intent.CATEGORY_OPENABLE);
+            i.setType("application/octet-stream");
+            i.putExtra(Intent.EXTRA_TITLE, "TrailNote-v3-" + new SimpleDateFormat("yyyyMMdd-HHmm", Locale.JAPAN).format(new Date()) + ".tnvault");
+            startActivityForResult(i, REQ_EXPORT);
+        });
+    }
+
+    private void startImport() {
+        Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        i.addCategory(Intent.CATEGORY_OPENABLE);
+        i.setType("*/*");
+        startActivityForResult(i, REQ_IMPORT);
+    }
+
+    private void askPassphrase(String title, boolean confirm, StringCallback callback) {
+        LinearLayout box = form();
+        EditText p1 = labeled(box, "バックアップ用パスフレーズ", "8文字以上", false);
+        p1.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        EditText p2 = null;
+        if (confirm) {
+            p2 = labeled(box, "確認", "もう一度入力", false);
+            p2.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        }
+        final EditText p2Final = p2;
+        AlertDialog d = new AlertDialog.Builder(this).setTitle(title).setView(box)
+                .setNegativeButton("キャンセル", null).setPositiveButton("続行", null).create();
+        d.setOnShowListener(x -> d.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
+            String value = p1.getText().toString();
+            if (value.length() < 8) { toast("8文字以上にしてください"); return; }
+            if (p2Final != null && !value.equals(p2Final.getText().toString())) { toast("一致しません"); return; }
+            d.dismiss(); callback.accept(value);
+        }));
+        d.show();
     }
 
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
-        if (vault.hasPin() && !vault.isSessionUnlocked()) {
-            pendingBackupPassphrase = null;
-            toast("Vaultが再ロックされました。解除後にもう一度操作してください");
-            return;
-        }
-        if (resultCode != RESULT_OK || data == null || data.getData() == null) {
-            pendingBackupPassphrase = null;
-            return;
-        }
+        if (resultCode != RESULT_OK || data == null || data.getData() == null) return;
         Uri uri = data.getData();
-        if (requestCode == REQ_EXPORT_VAULT) {
-            String passphrase = pendingBackupPassphrase;
-            pendingBackupPassphrase = null;
-            try (OutputStream out = getContentResolver().openOutputStream(uri)) {
-                if (out == null) throw new IllegalStateException("出力先を開けません");
-                String encrypted = vault.encryptBackup(load().toString(), passphrase);
-                out.write(encrypted.getBytes(StandardCharsets.UTF_8));
-                toast("暗号化バックアップを書き出しました");
-            } catch (Exception e) {
-                toast("書き出しに失敗しました");
-            }
-        } else if (requestCode == REQ_IMPORT_VAULT) {
-            try (InputStream in = getContentResolver().openInputStream(uri)) {
-                if (in == null) throw new IllegalStateException("ファイルを開けません");
-                ByteArrayOutputStream buffer = new ByteArrayOutputStream();
-                byte[] chunk = new byte[8192];
-                int n;
-                while ((n = in.read(chunk)) != -1) {
-                    if (buffer.size() + n > 10 * 1024 * 1024) {
-                        throw new IllegalArgumentException("バックアップが大きすぎます");
-                    }
-                    buffer.write(chunk, 0, n);
+        if (requestCode == REQ_EXPORT) {
+            try {
+                if (pendingExportPassphrase == null) return;
+                String envelope = vault.encryptBackup(repo.toJson(), pendingExportPassphrase);
+                try (OutputStream out = getContentResolver().openOutputStream(uri, "w")) {
+                    if (out == null) throw new IllegalStateException("出力先を開けません");
+                    out.write(envelope.getBytes(StandardCharsets.UTF_8));
                 }
-                showImportPassphraseDialog(buffer.toString(StandardCharsets.UTF_8.name()));
-            } catch (Exception e) {
-                toast("バックアップを読み込めません");
-            }
+                toast("暗号化Workspaceを書き出しました");
+            } catch (Exception e) { toast("Export失敗: " + safeMessage(e)); }
+            finally { pendingExportPassphrase = null; }
+        } else if (requestCode == REQ_IMPORT) {
+            try {
+                pendingImportEnvelope = readUri(uri);
+                askPassphrase("暗号化Import", false, pass -> {
+                    try {
+                        String json = vault.decryptBackup(pendingImportEnvelope, pass);
+                        repo.replaceJson(json);
+                        pendingImportEnvelope = null;
+                        renderPage();
+                        toast("Workspaceを復元しました");
+                    } catch (Exception e) { toast("復元失敗: " + safeMessage(e)); }
+                });
+            } catch (Exception e) { toast("Import読込失敗: " + safeMessage(e)); }
         }
     }
 
-    private View sectionHeader(String eyebrow, String title) {
-        LinearLayout box = new LinearLayout(this);
-        box.setOrientation(LinearLayout.VERTICAL);
-        TextView eye = text(eyebrow, 11, true);
-        eye.setTextColor(accent());
-        eye.setLetterSpacing(0.13f);
-        box.addView(eye);
-        TextView t = text(title, 20, true);
-        box.addView(t, topMargin(2));
+    private String readUri(Uri uri) throws Exception {
+        try (InputStream in = getContentResolver().openInputStream(uri); ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+            if (in == null) throw new IllegalStateException("入力を開けません");
+            byte[] buf = new byte[8192];
+            int n, total = 0;
+            while ((n = in.read(buf)) != -1) {
+                total += n;
+                if (total > MAX_IMPORT_BYTES) throw new IllegalArgumentException("10MiBを超えるバックアップは拒否しました");
+                out.write(buf, 0, n);
+            }
+            return out.toString(StandardCharsets.UTF_8.name());
+        }
+    }
+
+    private void confirmDelete(String label, ThrowingAction action) {
+        new AlertDialog.Builder(this).setTitle(label + "を削除")
+                .setMessage("この操作は取り消せません。")
+                .setNegativeButton("キャンセル", null)
+                .setPositiveButton("削除", (d, w) -> mutate(action))
+                .show();
+    }
+
+    private void mutate(ThrowingAction action) {
+        try { action.run(); renderPage(); }
+        catch (Exception e) { toast(safeMessage(e)); }
+    }
+
+    private LinearLayout hero(String eyebrow, String title, String description) {
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setPadding(dp(18), dp(18), dp(18), dp(18));
+        card.setBackground(round(heroBg(), dp(20), border()));
+        TextView e = text(eyebrow, 10, true); e.setTextColor(accent()); e.setLetterSpacing(0.12f); card.addView(e);
+        card.addView(text(title, 25, true), mt(6));
+        TextView d = text(description, 13, false); d.setTextColor(secondary()); d.setLineSpacing(0, 1.18f); card.addView(d, mt(8));
+        return card;
+    }
+
+    private LinearLayout section(String eyebrow, String title) {
+        LinearLayout box = column();
+        TextView e = text(eyebrow, 9, true); e.setTextColor(accent()); e.setLetterSpacing(0.13f); box.addView(e);
+        box.addView(text(title, 19, true), mt(3));
         return box;
     }
 
-    private TextView fieldLabel(String label, boolean required) {
-        TextView v = text(required ? label + "  *" : label, 12, true);
-        v.setTextColor(required ? fg() : muted());
-        return v;
-    }
-
-    private TextView text(String s, int sp, boolean bold) {
-        TextView v = new TextView(this);
-        v.setText(s);
-        v.setTextColor(fg());
-        v.setTextSize(TypedValue.COMPLEX_UNIT_SP, sp);
-        v.setTypeface(Typeface.create("sans-serif", bold ? Typeface.BOLD : Typeface.NORMAL));
-        return v;
-    }
-
-    private EditText edit(String hint, boolean multiline) {
-        EditText e = new EditText(this);
-        e.setHint(hint);
-        e.setHintTextColor(hintColor());
-        e.setTextColor(fg());
-        e.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
-        e.setSingleLine(!multiline);
-        e.setSelectAllOnFocus(false);
-        if (multiline) {
-            e.setMinLines(4);
-            e.setMaxLines(7);
-            e.setGravity(Gravity.TOP | Gravity.START);
-        }
-        e.setPadding(dp(13), dp(11), dp(13), dp(11));
-        e.setBackground(round(inputBg(), dp(12), dp(1), border()));
-        return e;
-    }
-
-    private EditText pinEdit(String hint) {
-        EditText e = edit(hint, false);
-        e.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_VARIATION_PASSWORD);
-        e.setGravity(Gravity.CENTER);
-        return e;
-    }
-
-    private EditText passwordEdit(String hint) {
-        EditText e = edit(hint, false);
-        e.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
-        return e;
-    }
-
-    private CheckBox check(String label) {
-        CheckBox c = new CheckBox(this);
-        c.setText(label);
-        c.setTextColor(fg());
-        c.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-        c.setButtonTintList(new ColorStateList(
-                new int[][]{new int[]{android.R.attr.state_checked}, new int[]{}},
-                new int[]{accent(), muted()}));
+    private LinearLayout card() {
+        LinearLayout c = column();
+        c.setPadding(dp(15), dp(14), dp(15), dp(14));
+        c.setBackground(round(surface(), dp(16), border()));
+        c.setElevation(dp(1));
         return c;
     }
 
-    private Button actionButton(String label, ButtonStyle style) {
-        Button b = new Button(this);
-        b.setText(label);
-        b.setAllCaps(false);
-        b.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
-        b.setTypeface(Typeface.create("sans-serif", Typeface.BOLD));
-        b.setMinHeight(dp(48));
-        b.setPadding(dp(12), dp(8), dp(12), dp(8));
-        b.setStateListAnimator(null);
-        switch (style) {
-            case PRIMARY:
-                b.setTextColor(Color.WHITE);
-                b.setBackground(round(accent(), dp(12), 0, Color.TRANSPARENT));
-                break;
-            case DANGER_GHOST:
-                b.setTextColor(danger());
-                b.setBackground(round(dangerSoft(), dp(12), dp(1), dangerBorder()));
-                break;
-            default:
-                b.setTextColor(fg());
-                b.setBackground(round(surface2(), dp(12), dp(1), border()));
-                break;
-        }
-        return b;
+    private View stat(String eyebrow, int value, String unit) {
+        LinearLayout c = card(); c.setPadding(dp(11), dp(11), dp(11), dp(11));
+        TextView e = text(eyebrow, 9, true); e.setTextColor(muted()); c.addView(e);
+        TextView v = text(String.valueOf(value), 23, true); v.setTextColor(accent()); c.addView(v, mt(3));
+        TextView u = text(unit, 10, false); u.setTextColor(muted()); c.addView(u);
+        return c;
     }
 
-    private Button miniButton(String label) {
-        Button b = actionButton(label, ButtonStyle.SECONDARY);
-        b.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
-        b.setMinHeight(dp(38));
-        b.setPadding(dp(6), dp(4), dp(6), dp(4));
-        return b;
+    private View progressCard(String title, int progress, String subtitle) {
+        LinearLayout c = card();
+        LinearLayout top = row(); top.addView(text(title, 14, true), weight()); top.addView(badge(progress + "%", accentSoft(), accent()), wrap()); c.addView(top);
+        TextView sub = text(subtitle, 10, false); sub.setTextColor(muted()); c.addView(sub, mt(3));
+        c.addView(progressBar(progress), mt(9));
+        return c;
     }
 
-    private LinearLayout panel(int radius, int color, boolean elevated) {
-        LinearLayout l = new LinearLayout(this);
-        l.setOrientation(LinearLayout.VERTICAL);
-        l.setBackground(round(color, radius, dp(1), border()));
-        if (elevated) l.setElevation(dp(2));
-        return l;
-    }
-
-    private StatBlock statBlock(String label, String value, String caption) {
-        LinearLayout card = panel(dp(16), cardBg(), true);
-        card.setPadding(dp(12), dp(12), dp(12), dp(12));
-        TextView labelView = text(label, 9, true);
-        labelView.setTextColor(muted());
-        labelView.setLetterSpacing(0.10f);
-        card.addView(labelView);
-        TextView valueView = text(value, 24, true);
-        card.addView(valueView, topMargin(2));
-        TextView captionView = text(caption, 11, false);
-        captionView.setTextColor(muted());
-        card.addView(captionView, topMargin(1));
-        return new StatBlock(card, valueView);
-    }
-
-    private GradientDrawable round(int color, float radius, int strokeWidth, int strokeColor) {
-        GradientDrawable gd = new GradientDrawable();
-        gd.setColor(color);
-        gd.setCornerRadius(radius);
-        if (strokeWidth > 0) gd.setStroke(strokeWidth, strokeColor);
-        return gd;
-    }
-
-    private LinearLayout.LayoutParams topMargin(int dpValue) {
-        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        p.topMargin = dp(dpValue);
+    private ProgressBar progressBar(int progress) {
+        ProgressBar p = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+        p.setMax(100); p.setProgress(clamp(progress, 0, 100)); p.setMinimumHeight(dp(8));
         return p;
     }
 
-    private LinearLayout.LayoutParams weight() {
-        return new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+    private TextView scoreBadge(int score) {
+        return badge(score + "/100", score >= 75 ? successSoft() : score >= 45 ? accentSoft() : dangerSoft(), score >= 75 ? success() : score >= 45 ? accent() : danger());
     }
 
-    private LinearLayout.LayoutParams weightWithRight(int rightDp) {
-        LinearLayout.LayoutParams p = weight();
-        p.rightMargin = dp(rightDp);
-        return p;
+    private TextView statusBadge(String status) {
+        String s = status == null ? "" : status.toUpperCase(Locale.ROOT);
+        boolean done = "DONE".equals(s) || "PUBLISHED".equals(s) || "READY".equals(s);
+        return badge(s.isEmpty() ? "STATE" : s, done ? successSoft() : accentSoft(), done ? success() : accent());
     }
 
-    private LinearLayout.LayoutParams wrap() {
-        return new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+    private TextView badge(String value, int bg, int fg) {
+        TextView t = text(value, 11, true);
+        t.setTextColor(fg); t.setGravity(Gravity.CENTER); t.setPadding(dp(10), dp(6), dp(10), dp(6));
+        t.setBackground(round(bg, dp(18), Color.TRANSPARENT));
+        return t;
     }
 
-    private int dp(int value) {
-        return (int) TypedValue.applyDimension(
-                TypedValue.COMPLEX_UNIT_DIP, value, getResources().getDisplayMetrics());
+    private View empty(String message) {
+        LinearLayout c = card();
+        TextView t = text(message, 12, false); t.setTextColor(muted()); t.setGravity(Gravity.CENTER); c.addView(t);
+        return c;
     }
 
-    private String format(long millis) {
-        if (millis <= 0) return "日時不明";
-        return new SimpleDateFormat("yyyy/MM/dd  HH:mm", Locale.JAPAN).format(new Date(millis));
+    private void addOptional(LinearLayout card, String label, String value) {
+        if (value == null || value.trim().isEmpty()) return;
+        TextView t = text(label + "  " + value, 11, false); t.setTextColor(secondary()); card.addView(t, mt(7));
     }
 
-    private int bg() { return dark ? Color.rgb(12, 15, 17) : Color.rgb(244, 247, 245); }
-    private int heroBg() { return dark ? Color.rgb(23, 29, 27) : Color.rgb(238, 246, 240); }
-    private int cardBg() { return dark ? Color.rgb(24, 28, 30) : Color.WHITE; }
-    private int selectedCardBg() { return dark ? Color.rgb(29, 36, 33) : Color.rgb(247, 252, 248); }
-    private int inputBg() { return dark ? Color.rgb(18, 22, 24) : Color.rgb(249, 250, 249); }
-    private int surface2() { return dark ? Color.rgb(34, 39, 41) : Color.rgb(244, 246, 245); }
-    private int fg() { return dark ? Color.rgb(242, 245, 243) : Color.rgb(24, 31, 27); }
-    private int secondaryText() { return dark ? Color.rgb(211, 216, 213) : Color.rgb(55, 64, 59); }
-    private int muted() { return dark ? Color.rgb(154, 165, 159) : Color.rgb(103, 114, 108); }
-    private int hintColor() { return dark ? Color.rgb(120, 130, 125) : Color.rgb(145, 154, 149); }
-    private int border() { return dark ? Color.rgb(53, 61, 57) : Color.rgb(222, 229, 224); }
-    private int accent() { return dark ? Color.rgb(101, 203, 132) : Color.rgb(28, 127, 69); }
-    private int accentSoft() { return dark ? Color.rgb(28, 58, 39) : Color.rgb(229, 245, 235); }
-    private int selectedAccent() { return dark ? Color.rgb(122, 181, 255) : Color.rgb(42, 105, 190); }
-    private int selectedSoft() { return dark ? Color.rgb(28, 48, 70) : Color.rgb(232, 241, 252); }
-    private int success() { return dark ? Color.rgb(111, 211, 144) : Color.rgb(31, 137, 75); }
-    private int successSoft() { return dark ? Color.rgb(27, 55, 37) : Color.rgb(231, 247, 237); }
-    private int danger() { return dark ? Color.rgb(255, 132, 132) : Color.rgb(184, 53, 53); }
-    private int dangerSoft() { return dark ? Color.rgb(58, 31, 31) : Color.rgb(255, 244, 244); }
-    private int dangerBorder() { return dark ? Color.rgb(105, 58, 58) : Color.rgb(240, 203, 203); }
-
-    private void toast(String s) {
-        Toast.makeText(this, s, Toast.LENGTH_SHORT).show();
+    private LinearLayout form() {
+        LinearLayout box = column(); box.setPadding(dp(20), dp(4), dp(20), dp(12)); return box;
     }
 
-    private enum ButtonStyle { PRIMARY, SECONDARY, DANGER_GHOST }
-
-    private static final class StatBlock {
-        final LinearLayout root;
-        final TextView value;
-        StatBlock(LinearLayout root, TextView value) {
-            this.root = root;
-            this.value = value;
-        }
+    private EditText labeled(LinearLayout box, String label, String hint, boolean number) {
+        TextView l = text(label, 11, true); l.setTextColor(muted()); box.addView(l, mt(10));
+        EditText e = input(hint, number); box.addView(e, mt(4)); return e;
     }
+
+    private EditText input(String hint, boolean number) {
+        EditText e = new EditText(this);
+        e.setHint(hint); e.setHintTextColor(muted()); e.setTextColor(fg()); e.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        e.setSingleLine(false); e.setPadding(dp(12), dp(10), dp(12), dp(10)); e.setBackground(round(surface2(), dp(12), border()));
+        if (number) e.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_VARIATION_PASSWORD);
+        return e;
+    }
+
+    private CheckBox checkbox(String label) {
+        CheckBox b = new CheckBox(this); b.setText(label); b.setTextColor(fg()); b.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13); return b;
+    }
+
+    private Button button(String label, boolean primary) {
+        Button b = new Button(this); b.setText(label); b.setAllCaps(false); b.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        b.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12); b.setMinHeight(0); b.setMinimumHeight(0); b.setStateListAnimator(null);
+        b.setTextColor(primary ? Color.WHITE : fg()); b.setBackground(round(primary ? accent() : surface2(), dp(13), primary ? Color.TRANSPARENT : border()));
+        return b;
+    }
+
+    private Button mini(String label) {
+        Button b = button(label, false); b.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10); return b;
+    }
+
+    private void styleNav(Button b, boolean active) {
+        b.setTextColor(active ? accent() : muted());
+        b.setBackground(round(active ? accentSoft() : Color.TRANSPARENT, dp(13), Color.TRANSPARENT));
+    }
+
+    private TextView text(String value, float sp, boolean bold) {
+        TextView t = new TextView(this); t.setText(value); t.setTextColor(fg()); t.setTextSize(TypedValue.COMPLEX_UNIT_SP, sp);
+        if (bold) t.setTypeface(Typeface.DEFAULT, Typeface.BOLD); return t;
+    }
+
+    private LinearLayout column() { LinearLayout l = new LinearLayout(this); l.setOrientation(LinearLayout.VERTICAL); return l; }
+    private LinearLayout row() { LinearLayout l = new LinearLayout(this); l.setOrientation(LinearLayout.HORIZONTAL); l.setGravity(Gravity.CENTER_VERTICAL); return l; }
+    private LinearLayout.LayoutParams weight() { return new LinearLayout.LayoutParams(0, -2, 1f); }
+    private LinearLayout.LayoutParams weightMargin(int right) { LinearLayout.LayoutParams p = weight(); p.rightMargin = dp(right); return p; }
+    private LinearLayout.LayoutParams wrap() { return new LinearLayout.LayoutParams(-2, -2); }
+    private LinearLayout.LayoutParams mt(int top) { LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(-1, -2); p.topMargin = dp(top); return p; }
+    private LinearLayout.LayoutParams size(int w, int h) { return new LinearLayout.LayoutParams(w, h); }
+
+    private GradientDrawable round(int color, int radius, int stroke) {
+        GradientDrawable d = new GradientDrawable(); d.setColor(color); d.setCornerRadius(radius);
+        if (stroke != Color.TRANSPARENT) d.setStroke(dp(1), stroke); return d;
+    }
+
+    private int number(EditText e, int fallback) {
+        try { return clamp(Integer.parseInt(e.getText().toString().trim()), 1, 5); }
+        catch (Exception ex) { return fallback; }
+    }
+
+    private static int clamp(int v, int min, int max) { return Math.max(min, Math.min(max, v)); }
+
+    private static String nextPlanStatus(String s) {
+        if ("PLANNED".equalsIgnoreCase(s)) return "READY";
+        if ("READY".equalsIgnoreCase(s)) return "DONE";
+        return "PLANNED";
+    }
+
+    private static String nextMediaStage(String s) {
+        if ("RAW".equalsIgnoreCase(s)) return "SELECT";
+        if ("SELECT".equalsIgnoreCase(s)) return "EDIT";
+        if ("EDIT".equalsIgnoreCase(s)) return "READY";
+        if ("READY".equalsIgnoreCase(s)) return "PUBLISHED";
+        return "RAW";
+    }
+
+    private int dp(int v) { return (int) TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v, getResources().getDisplayMetrics()); }
+    private int bg() { return dark ? Color.rgb(13, 16, 18) : Color.rgb(246, 248, 250); }
+    private int surface() { return dark ? Color.rgb(25, 29, 32) : Color.WHITE; }
+    private int surface2() { return dark ? Color.rgb(35, 40, 44) : Color.rgb(239, 243, 246); }
+    private int heroBg() { return dark ? Color.rgb(19, 34, 29) : Color.rgb(234, 246, 238); }
+    private int fg() { return dark ? Color.rgb(241, 244, 242) : Color.rgb(27, 33, 30); }
+    private int secondary() { return dark ? Color.rgb(190, 199, 194) : Color.rgb(78, 88, 83); }
+    private int muted() { return dark ? Color.rgb(142, 153, 147) : Color.rgb(112, 124, 118); }
+    private int border() { return dark ? Color.rgb(52, 59, 55) : Color.rgb(220, 227, 222); }
+    private int accent() { return Color.rgb(42, 125, 72); }
+    private int accentSoft() { return dark ? Color.rgb(33, 65, 45) : Color.rgb(224, 242, 230); }
+    private int success() { return Color.rgb(36, 133, 78); }
+    private int successSoft() { return dark ? Color.rgb(28, 66, 45) : Color.rgb(224, 244, 232); }
+    private int danger() { return Color.rgb(190, 62, 62); }
+    private int dangerSoft() { return dark ? Color.rgb(75, 35, 35) : Color.rgb(251, 231, 231); }
+
+    private void toast(String message) { Toast.makeText(this, message, Toast.LENGTH_SHORT).show(); }
+    private static String safeMessage(Throwable e) { return e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage(); }
 }

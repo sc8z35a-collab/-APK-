@@ -2,4 +2,10 @@
 .idea/
 local.properties
 **/build/
+TrailNote/dist/
 *.iml
+*.jks
+*.keystore
+*.p12
+*.pfx
+signing.properties
