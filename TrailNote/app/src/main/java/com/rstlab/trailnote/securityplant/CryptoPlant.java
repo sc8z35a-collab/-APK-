@@ -6,7 +6,6 @@ import android.os.Build;
 import android.security.keystore.KeyGenParameterSpec;
 import android.security.keystore.KeyInfo;
 import android.security.keystore.KeyProperties;
-import android.security.keystore.StrongBoxUnavailableException;
 import android.util.Base64;
 
 import org.json.JSONArray;
@@ -14,12 +13,9 @@ import org.json.JSONObject;
 
 import java.nio.charset.StandardCharsets;
 import java.security.KeyStore;
-import java.security.ProviderException;
 import java.security.SecureRandom;
-import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Iterator;
-import java.util.List;
 
 import javax.crypto.Cipher;
 import javax.crypto.KeyGenerator;
@@ -32,13 +28,14 @@ import javax.crypto.spec.SecretKeySpec;
 /**
  * Security Container Plant cryptographic root.
  *
- * v4 adds two independent hardening layers while preserving legacy migration:
- *  - StrongBox-first Android Keystore root key (TEE/software Keystore fallback).
- *  - H4 compartmentalized workspace encryption: each logical domain owns a random
- *    256-bit DEK, independently wrapped by the root boundary.
+ * v4 hierarchy:
+ *   StrongBox/Android-Keystore hardware root (or PIN-unwrapped session root)
+ *       -> random 256-bit Workspace KEK
+ *           -> independent random 256-bit Domain DEKs
+ *               -> logs / spots / plans / missions / assets / gear
  *
  * Legacy direct/M2/M3 payloads remain readable and are rewritten as H4 after a
- * successful authenticated read.
+ * successful authenticated read. Existing v2/v3 PIN metadata is upgraded in-place.
  */
 final class CryptoPlant {
     private static final String KEYSTORE = "AndroidKeyStore";
@@ -55,6 +52,7 @@ final class CryptoPlant {
     private static final String KEY_FAILED = "failed_attempts";
     private static final String KEY_LOCK_UNTIL = "lock_until";
     private static final String KEY_HW_MODE = "hardware_root_mode";
+    private static final String KEY_WORKSPACE_KEK_WRAP = "workspace_kek_wrap_v1";
     private static final String DOMAIN_WRAP_PREFIX = "domain_dek_wrap_";
     private static final String MASTER_PREFIX = "M3.";
     private static final String HIERARCHY_PREFIX = "H4.";
@@ -87,18 +85,18 @@ final class CryptoPlant {
     void setPin(String pin) throws Exception {
         if (!isValidPin(pin)) throw new IllegalArgumentException("PINは6〜12桁で設定してください");
         boolean changing = hasPin();
-        List<DomainKey> existingDomainKeys = new ArrayList<>();
-        String legacyDirectPlain = null;
+        String existingPlain = null;
+        byte[] existingWorkspaceKek = null;
 
         if (changing) {
             if (sessionMasterKey == null) throw new SecurityException("PIN変更前にVaultを解除してください");
         } else {
-            // Read existing no-PIN DEKs before switching their wrapping boundary to the PIN root.
-            existingDomainKeys = readExistingDomainKeys(false);
             String current = secureDataPrefs.getString(KEY_ENTRIES, null);
-            if (current != null && !current.startsWith(HIERARCHY_PREFIX)
-                    && !current.startsWith("M2.") && !current.startsWith(MASTER_PREFIX)) {
-                legacyDirectPlain = decryptLocalDirect(current);
+            if (current != null && current.startsWith(HIERARCHY_PREFIX)) {
+                existingWorkspaceKek = getOrCreateWorkspaceKek(); // current no-PIN boundary
+                existingPlain = decryptHierarchyEnvelope(current.substring(HIERARCHY_PREFIX.length()));
+            } else if (current != null && !current.startsWith("M2.") && !current.startsWith(MASTER_PREFIX)) {
+                existingPlain = decryptLocalDirect(current);
             }
             sessionMasterKey = randomBytes(32);
         }
@@ -107,11 +105,15 @@ final class CryptoPlant {
                 "SecurityPlantMaster:pin:v4", "SecurityPlantMaster:hardware:v4", true);
 
         if (!changing) {
-            for (DomainKey key : existingDomainKeys) {
-                storeDomainKey(key.domain, key.bytes, true);
-                Arrays.fill(key.bytes, (byte) 0);
+            if (existingWorkspaceKek != null) {
+                try {
+                    storeWorkspaceKek(existingWorkspaceKek, true);
+                } finally {
+                    Arrays.fill(existingWorkspaceKek, (byte) 0);
+                }
             }
-            if (legacyDirectPlain != null) saveEntries(legacyDirectPlain);
+            // H4 metadata is root-bound, so re-encrypt after moving the Workspace KEK boundary.
+            if (existingPlain != null) saveEntries(existingPlain);
         }
     }
 
@@ -152,7 +154,7 @@ final class CryptoPlant {
             securityPrefs.edit().putInt(KEY_FAILED, 0).putLong(KEY_LOCK_UNTIL, 0L).apply();
 
             if (version < PIN_VERSION) {
-                // Same root key, rewrapped under StrongBox/modern Keystore and stronger v4 KDF metadata.
+                // Same in-memory root, newly wrapped by StrongBox/modern Keystore and v4 KDF metadata.
                 writePinMetadata(pin, PIN_ITERATIONS, WRAP_ITERATIONS, PIN_VERSION,
                         "SecurityPlantMaster:pin:v4", "SecurityPlantMaster:hardware:v4", true);
             }
@@ -226,9 +228,11 @@ final class CryptoPlant {
         if (hasPin()) {
             requireUnlocked();
             if (encrypted.startsWith(MASTER_PREFIX)) {
-                plain = decryptWithMaster(encrypted.substring(MASTER_PREFIX.length()), "SecurityPlantEntries:master:v3");
+                plain = new String(decryptWithMaster(encrypted.substring(MASTER_PREFIX.length()),
+                        "SecurityPlantEntries:master:v3"), StandardCharsets.UTF_8);
             } else if (encrypted.startsWith("M2.")) {
-                plain = decryptWithMaster(encrypted.substring(3), "TrailNoteEntries:master:v2");
+                plain = new String(decryptWithMaster(encrypted.substring(3),
+                        "TrailNoteEntries:master:v2"), StandardCharsets.UTF_8);
             } else {
                 plain = decryptLocalDirect(encrypted);
             }
@@ -254,11 +258,12 @@ final class CryptoPlant {
 
     boolean hierarchyConfigured() {
         String value = secureDataPrefs.getString(KEY_ENTRIES, "");
-        return value.startsWith(HIERARCHY_PREFIX);
+        return value.startsWith(HIERARCHY_PREFIX)
+                && securityPrefs.contains(KEY_WORKSPACE_KEK_WRAP);
     }
 
     String summary() {
-        return "Security Plant H4 compartmentalized AES-256-GCM / " + hardwareBackedSummary()
+        return "Security Plant H4 Root→Workspace-KEK→Domain-DEK AES-256-GCM / " + hardwareBackedSummary()
                 + (hasPin() ? " / PIN-wrapped root" : " / device-bound root");
     }
 
@@ -361,7 +366,8 @@ final class CryptoPlant {
         JSONObject envelope = new JSONObject();
         envelope.put("format", "TrailNoteHierarchy");
         envelope.put("version", 1);
-        envelope.put("meta", encryptRoot(meta.toString().getBytes(StandardCharsets.UTF_8), "SecurityPlantHierarchyMeta:v1"));
+        envelope.put("meta", encryptRoot(meta.toString().getBytes(StandardCharsets.UTF_8),
+                "SecurityPlantHierarchyMeta:v1"));
         JSONObject domains = new JSONObject();
         for (String domain : DOMAINS) {
             JSONArray array = root.optJSONArray(domain);
@@ -407,38 +413,46 @@ final class CryptoPlant {
         return root.toString();
     }
 
-    private byte[] getOrCreateDomainKey(String domain) throws Exception {
-        String stored = securityPrefs.getString(DOMAIN_WRAP_PREFIX + domain, null);
+    private byte[] getOrCreateWorkspaceKek() throws Exception {
+        String stored = securityPrefs.getString(KEY_WORKSPACE_KEK_WRAP, null);
         if (stored != null) {
             return hasPin()
-                    ? decryptWithMaster(stored, "SecurityPlantDomainDEK:" + domain + ":root:v1")
-                    : decryptWithCurrentKeystore(stored, "SecurityPlantDomainDEK:" + domain + ":device:v1");
+                    ? decryptWithMaster(stored, "SecurityPlantWorkspaceKEK:root:v1")
+                    : decryptWithCurrentKeystore(stored, "SecurityPlantWorkspaceKEK:device:v1");
         }
-        byte[] dek = randomBytes(32);
-        storeDomainKey(domain, dek, hasPin());
-        return dek;
+        byte[] kek = randomBytes(32);
+        storeWorkspaceKek(kek, hasPin());
+        return kek;
     }
 
-    private void storeDomainKey(String domain, byte[] dek, boolean pinMode) throws Exception {
+    private void storeWorkspaceKek(byte[] kek, boolean pinMode) throws Exception {
         String wrapped = pinMode
-                ? encryptWithMaster(dek, "SecurityPlantDomainDEK:" + domain + ":root:v1")
-                : encryptWithCurrentKeystore(dek, "SecurityPlantDomainDEK:" + domain + ":device:v1");
-        if (!securityPrefs.edit().putString(DOMAIN_WRAP_PREFIX + domain, wrapped).commit()) {
-            throw new IllegalStateException("Domain key wrap commit failed: " + domain);
+                ? encryptWithMaster(kek, "SecurityPlantWorkspaceKEK:root:v1")
+                : encryptWithCurrentKeystore(kek, "SecurityPlantWorkspaceKEK:device:v1");
+        if (!securityPrefs.edit().putString(KEY_WORKSPACE_KEK_WRAP, wrapped).commit()) {
+            throw new IllegalStateException("Workspace KEK wrap commit failed");
         }
     }
 
-    private List<DomainKey> readExistingDomainKeys(boolean pinMode) throws Exception {
-        List<DomainKey> result = new ArrayList<>();
-        for (String domain : DOMAINS) {
+    private byte[] getOrCreateDomainKey(String domain) throws Exception {
+        byte[] workspaceKek = getOrCreateWorkspaceKek();
+        try {
             String stored = securityPrefs.getString(DOMAIN_WRAP_PREFIX + domain, null);
-            if (stored == null) continue;
-            byte[] key = pinMode
-                    ? decryptWithMaster(stored, "SecurityPlantDomainDEK:" + domain + ":root:v1")
-                    : decryptWithCurrentKeystore(stored, "SecurityPlantDomainDEK:" + domain + ":device:v1");
-            result.add(new DomainKey(domain, key));
+            if (stored != null) {
+                return decryptWithRawKey(stored, workspaceKek,
+                        "SecurityPlantDomainDEK:" + domain + ":workspace:v1");
+            }
+            byte[] dek = randomBytes(32);
+            String wrapped = encryptWithRawKey(dek, workspaceKek,
+                    "SecurityPlantDomainDEK:" + domain + ":workspace:v1");
+            if (!securityPrefs.edit().putString(DOMAIN_WRAP_PREFIX + domain, wrapped).commit()) {
+                Arrays.fill(dek, (byte) 0);
+                throw new IllegalStateException("Domain key wrap commit failed: " + domain);
+            }
+            return dek;
+        } finally {
+            Arrays.fill(workspaceKek, (byte) 0);
         }
-        return result;
     }
 
     private void migrateLegacyPayloadIfNeeded() throws Exception {
@@ -446,9 +460,11 @@ final class CryptoPlant {
         if (encrypted == null || encrypted.startsWith(HIERARCHY_PREFIX)) return;
         String plain;
         if (encrypted.startsWith(MASTER_PREFIX)) {
-            plain = decryptWithMaster(encrypted.substring(MASTER_PREFIX.length()), "SecurityPlantEntries:master:v3");
+            plain = new String(decryptWithMaster(encrypted.substring(MASTER_PREFIX.length()),
+                    "SecurityPlantEntries:master:v3"), StandardCharsets.UTF_8);
         } else if (encrypted.startsWith("M2.")) {
-            plain = decryptWithMaster(encrypted.substring(3), "TrailNoteEntries:master:v2");
+            plain = new String(decryptWithMaster(encrypted.substring(3),
+                    "TrailNoteEntries:master:v2"), StandardCharsets.UTF_8);
         } else {
             plain = decryptLocalDirect(encrypted);
         }
@@ -491,17 +507,21 @@ final class CryptoPlant {
     }
 
     private String encryptLocalDirect(String plaintext) throws Exception {
-        return "K2." + encryptWithCurrentKeystore(plaintext.getBytes(StandardCharsets.UTF_8), "SecurityPlantLocal:direct:v4");
+        return "K2." + encryptWithCurrentKeystore(plaintext.getBytes(StandardCharsets.UTF_8),
+                "SecurityPlantLocal:direct:v4");
     }
 
     private String decryptLocalDirect(String packed) throws Exception {
         if (packed.startsWith("K2.")) {
-            return new String(decryptWithCurrentKeystore(packed.substring(3), "SecurityPlantLocal:direct:v4"), StandardCharsets.UTF_8);
+            return new String(decryptWithCurrentKeystore(packed.substring(3),
+                    "SecurityPlantLocal:direct:v4"), StandardCharsets.UTF_8);
         }
         try {
-            return new String(decryptWithLegacyKeystore(packed, "SecurityPlantLocal:direct:v3"), StandardCharsets.UTF_8);
+            return new String(decryptWithLegacyKeystore(packed,
+                    "SecurityPlantLocal:direct:v3"), StandardCharsets.UTF_8);
         } catch (Exception first) {
-            return new String(decryptWithLegacyKeystore(packed, "TrailNoteLocal:direct:v1"), StandardCharsets.UTF_8);
+            return new String(decryptWithLegacyKeystore(packed,
+                    "TrailNoteLocal:direct:v1"), StandardCharsets.UTF_8);
         }
     }
 
@@ -571,8 +591,8 @@ final class CryptoPlant {
                 SecretKey key = generateHardwareKey(true);
                 securityPrefs.edit().putString(KEY_HW_MODE, "STRONGBOX").commit();
                 return key;
-            } catch (StrongBoxUnavailableException | ProviderException e) {
-                // Explicitly permitted fallback: Android Keystore backed by TEE when available.
+            } catch (Exception strongBoxUnavailableOrUnsupported) {
+                // Explicit fallback to the normal Android Keystore, normally TEE-backed when available.
             }
         }
         SecretKey key = generateHardwareKey(false);
@@ -641,10 +661,4 @@ final class CryptoPlant {
 
     private static String b64(byte[] data) { return Base64.encodeToString(data, Base64.NO_WRAP); }
     private static byte[] unb64(String text) { return Base64.decode(text, Base64.NO_WRAP); }
-
-    private static final class DomainKey {
-        final String domain;
-        final byte[] bytes;
-        DomainKey(String domain, byte[] bytes) { this.domain = domain; this.bytes = bytes; }
-    }
 }
