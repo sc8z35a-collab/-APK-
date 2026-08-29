@@ -2,16 +2,24 @@ package com.rstlab.trailnote.securityplant;
 
 import android.content.Context;
 import android.content.SharedPreferences;
+import android.os.Build;
 import android.security.keystore.KeyGenParameterSpec;
+import android.security.keystore.KeyInfo;
 import android.security.keystore.KeyProperties;
+import android.security.keystore.StrongBoxUnavailableException;
 import android.util.Base64;
 
+import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.nio.charset.StandardCharsets;
 import java.security.KeyStore;
+import java.security.ProviderException;
 import java.security.SecureRandom;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Iterator;
+import java.util.List;
 
 import javax.crypto.Cipher;
 import javax.crypto.KeyGenerator;
@@ -22,20 +30,20 @@ import javax.crypto.spec.PBEKeySpec;
 import javax.crypto.spec.SecretKeySpec;
 
 /**
- * Cryptographic core for Security Container Plant.
+ * Security Container Plant cryptographic root.
  *
- * PIN enabled mode is dual-key:
- * 1) random 256-bit master key encrypts protected app data with AES-GCM;
- * 2) an Android Keystore AES key wraps the master key;
- * 3) a separately salted PIN-derived AES key wraps the Keystore-wrapped blob.
+ * v4 adds two independent hardening layers while preserving legacy migration:
+ *  - StrongBox-first Android Keystore root key (TEE/software Keystore fallback).
+ *  - H4 compartmentalized workspace encryption: each logical domain owns a random
+ *    256-bit DEK, independently wrapped by the root boundary.
  *
- * v1.3 PIN metadata (160k/220k PBKDF2 and M2 payloads) is accepted, then
- * upgraded in-place to the stronger v3 KDF metadata and M3 payload format.
+ * Legacy direct/M2/M3 payloads remain readable and are rewritten as H4 after a
+ * successful authenticated read.
  */
 final class CryptoPlant {
     private static final String KEYSTORE = "AndroidKeyStore";
-    // Preserve the existing device-bound key so v1.x ciphertext remains decryptable.
-    private static final String KEY_ALIAS = "trailnote.vault.aes.v1";
+    private static final String LEGACY_KEY_ALIAS = "trailnote.vault.aes.v1";
+    private static final String HARDWARE_KEY_ALIAS = "trailnote.vault.aes.v2.hardware";
     private static final String PREF_SECURITY = "trailnote_security_v1";
     private static final String PREF_SECURE_DATA = "trailnote_secure_data_v1";
     private static final String KEY_ENTRIES = "entries_enc";
@@ -46,13 +54,18 @@ final class CryptoPlant {
     private static final String KEY_PIN_VERSION = "pin_version";
     private static final String KEY_FAILED = "failed_attempts";
     private static final String KEY_LOCK_UNTIL = "lock_until";
+    private static final String KEY_HW_MODE = "hardware_root_mode";
+    private static final String DOMAIN_WRAP_PREFIX = "domain_dek_wrap_";
     private static final String MASTER_PREFIX = "M3.";
+    private static final String HIERARCHY_PREFIX = "H4.";
     private static final int LEGACY_PIN_ITERATIONS = 160_000;
     private static final int LEGACY_WRAP_ITERATIONS = 220_000;
-    private static final int PIN_ITERATIONS = 220_000;
-    private static final int WRAP_ITERATIONS = 360_000;
-    private static final int BACKUP_ITERATIONS = 360_000;
+    private static final int PIN_ITERATIONS = 240_000;
+    private static final int WRAP_ITERATIONS = 420_000;
+    private static final int BACKUP_ITERATIONS = 420_000;
     private static final int GCM_TAG_BITS = 128;
+    private static final int PIN_VERSION = 4;
+    private static final String[] DOMAINS = {"logs", "spots", "plans", "missions", "assets", "gear"};
 
     private final SharedPreferences securityPrefs;
     private final SharedPreferences secureDataPrefs;
@@ -74,23 +87,31 @@ final class CryptoPlant {
     void setPin(String pin) throws Exception {
         if (!isValidPin(pin)) throw new IllegalArgumentException("PINは6〜12桁で設定してください");
         boolean changing = hasPin();
-        String existingDirectCipher = null;
+        List<DomainKey> existingDomainKeys = new ArrayList<>();
+        String legacyDirectPlain = null;
+
         if (changing) {
             if (sessionMasterKey == null) throw new SecurityException("PIN変更前にVaultを解除してください");
         } else {
-            sessionMasterKey = randomBytes(32);
+            // Read existing no-PIN DEKs before switching their wrapping boundary to the PIN root.
+            existingDomainKeys = readExistingDomainKeys(false);
             String current = secureDataPrefs.getString(KEY_ENTRIES, null);
-            if (current != null && !current.startsWith("M2.") && !current.startsWith(MASTER_PREFIX)) {
-                existingDirectCipher = current;
+            if (current != null && !current.startsWith(HIERARCHY_PREFIX)
+                    && !current.startsWith("M2.") && !current.startsWith(MASTER_PREFIX)) {
+                legacyDirectPlain = decryptLocalDirect(current);
             }
+            sessionMasterKey = randomBytes(32);
         }
 
-        writePinMetadata(pin, PIN_ITERATIONS, WRAP_ITERATIONS, 3,
-                "SecurityPlantMaster:pin:v3", "SecurityPlantMaster:keystore:v3");
+        writePinMetadata(pin, PIN_ITERATIONS, WRAP_ITERATIONS, PIN_VERSION,
+                "SecurityPlantMaster:pin:v4", "SecurityPlantMaster:hardware:v4", true);
 
-        if (!changing && existingDirectCipher != null) {
-            String plain = decryptLocalDirect(existingDirectCipher);
-            saveEntries(plain);
+        if (!changing) {
+            for (DomainKey key : existingDomainKeys) {
+                storeDomainKey(key.domain, key.bytes, true);
+                Arrays.fill(key.bytes, (byte) 0);
+            }
+            if (legacyDirectPlain != null) saveEntries(legacyDirectPlain);
         }
     }
 
@@ -99,10 +120,12 @@ final class CryptoPlant {
         if (isLockedOut()) return false;
 
         int version = securityPrefs.getInt(KEY_PIN_VERSION, 2);
-        int pinIterations = version >= 3 ? PIN_ITERATIONS : LEGACY_PIN_ITERATIONS;
-        int wrapIterations = version >= 3 ? WRAP_ITERATIONS : LEGACY_WRAP_ITERATIONS;
-        String pinAad = version >= 3 ? "SecurityPlantMaster:pin:v3" : "TrailNoteMasterWrap:pin:v2";
-        String keystoreAad = version >= 3 ? "SecurityPlantMaster:keystore:v3" : "TrailNoteMasterWrap:keystore:v2";
+        int pinIterations = version >= 4 ? PIN_ITERATIONS : (version >= 3 ? 220_000 : LEGACY_PIN_ITERATIONS);
+        int wrapIterations = version >= 4 ? WRAP_ITERATIONS : (version >= 3 ? 360_000 : LEGACY_WRAP_ITERATIONS);
+        String pinAad = version >= 4 ? "SecurityPlantMaster:pin:v4"
+                : version >= 3 ? "SecurityPlantMaster:pin:v3" : "TrailNoteMasterWrap:pin:v2";
+        String keystoreAad = version >= 4 ? "SecurityPlantMaster:hardware:v4"
+                : version >= 3 ? "SecurityPlantMaster:keystore:v3" : "TrailNoteMasterWrap:keystore:v2";
 
         byte[] salt = unb64(securityPrefs.getString(KEY_PIN_SALT, ""));
         byte[] expected = unb64(securityPrefs.getString(KEY_PIN_HASH, ""));
@@ -119,19 +142,21 @@ final class CryptoPlant {
         try {
             byte[] keystoreWrappedBytes = decryptWithRawKey(
                     securityPrefs.getString(KEY_MASTER_WRAP, ""), pinWrapKey, pinAad);
-            byte[] master = decryptWithKeystore(
-                    new String(keystoreWrappedBytes, StandardCharsets.UTF_8), keystoreAad);
+            byte[] master = version >= 4
+                    ? decryptWithCurrentKeystore(new String(keystoreWrappedBytes, StandardCharsets.UTF_8), keystoreAad)
+                    : decryptWithLegacyKeystore(new String(keystoreWrappedBytes, StandardCharsets.UTF_8), keystoreAad);
             Arrays.fill(keystoreWrappedBytes, (byte) 0);
             if (master.length != 32) throw new SecurityException("Vault master key length mismatch");
             lockSession();
             sessionMasterKey = master;
             securityPrefs.edit().putInt(KEY_FAILED, 0).putLong(KEY_LOCK_UNTIL, 0L).apply();
 
-            if (version < 3) {
-                writePinMetadata(pin, PIN_ITERATIONS, WRAP_ITERATIONS, 3,
-                        "SecurityPlantMaster:pin:v3", "SecurityPlantMaster:keystore:v3");
+            if (version < PIN_VERSION) {
+                // Same root key, rewrapped under StrongBox/modern Keystore and stronger v4 KDF metadata.
+                writePinMetadata(pin, PIN_ITERATIONS, WRAP_ITERATIONS, PIN_VERSION,
+                        "SecurityPlantMaster:pin:v4", "SecurityPlantMaster:hardware:v4", true);
             }
-            migrateLegacyMasterPrefixIfNeeded();
+            migrateLegacyPayloadIfNeeded();
             return true;
         } catch (Exception e) {
             registerFailedAttempt();
@@ -143,14 +168,16 @@ final class CryptoPlant {
     }
 
     private void writePinMetadata(String pin, int pinIterations, int wrapIterations, int version,
-                                  String pinAad, String keystoreAad) throws Exception {
-        if (sessionMasterKey == null) throw new SecurityException("Vault master key unavailable");
+                                  String pinAad, String keystoreAad, boolean modernKeystore) throws Exception {
+        if (sessionMasterKey == null) throw new SecurityException("Vault root key unavailable");
         byte[] verifySalt = randomBytes(16);
         byte[] verifyHash = pbkdf2(pin.toCharArray(), verifySalt, pinIterations, 32);
         byte[] wrapSalt = randomBytes(16);
         byte[] pinWrapKey = pbkdf2(pin.toCharArray(), wrapSalt, wrapIterations, 32);
         try {
-            String keystoreWrappedMaster = encryptWithKeystore(sessionMasterKey, keystoreAad);
+            String keystoreWrappedMaster = modernKeystore
+                    ? encryptWithCurrentKeystore(sessionMasterKey, keystoreAad)
+                    : encryptWithLegacyKeystore(sessionMasterKey, keystoreAad);
             String pinWrappedMaster = encryptWithRawKey(
                     keystoreWrappedMaster.getBytes(StandardCharsets.UTF_8), pinWrapKey, pinAad);
             boolean committed = securityPrefs.edit()
@@ -176,21 +203,10 @@ final class CryptoPlant {
         }
     }
 
-    boolean isSessionUnlocked() {
-        return !hasPin() || sessionMasterKey != null;
-    }
-
-    boolean isLockedOut() {
-        return System.currentTimeMillis() < lockoutUntil();
-    }
-
-    long lockoutUntil() {
-        return securityPrefs.getLong(KEY_LOCK_UNTIL, 0L);
-    }
-
-    int failedAttempts() {
-        return securityPrefs.getInt(KEY_FAILED, 0);
-    }
+    boolean isSessionUnlocked() { return !hasPin() || sessionMasterKey != null; }
+    boolean isLockedOut() { return System.currentTimeMillis() < lockoutUntil(); }
+    long lockoutUntil() { return securityPrefs.getLong(KEY_LOCK_UNTIL, 0L); }
+    int failedAttempts() { return securityPrefs.getInt(KEY_FAILED, 0); }
 
     String loadEntries(SharedPreferences legacyPrefs, String legacyKey) throws Exception {
         String encrypted = secureDataPrefs.getString(KEY_ENTRIES, null);
@@ -200,47 +216,67 @@ final class CryptoPlant {
             legacyPrefs.edit().remove(legacyKey).apply();
             return legacy;
         }
+
+        if (encrypted.startsWith(HIERARCHY_PREFIX)) {
+            if (hasPin()) requireUnlocked();
+            return decryptHierarchyEnvelope(encrypted.substring(HIERARCHY_PREFIX.length()));
+        }
+
+        String plain;
         if (hasPin()) {
             requireUnlocked();
             if (encrypted.startsWith(MASTER_PREFIX)) {
-                return decryptWithMaster(encrypted.substring(MASTER_PREFIX.length()), "SecurityPlantEntries:master:v3");
+                plain = decryptWithMaster(encrypted.substring(MASTER_PREFIX.length()), "SecurityPlantEntries:master:v3");
+            } else if (encrypted.startsWith("M2.")) {
+                plain = decryptWithMaster(encrypted.substring(3), "TrailNoteEntries:master:v2");
+            } else {
+                plain = decryptLocalDirect(encrypted);
             }
-            if (encrypted.startsWith("M2.")) {
-                String plain = decryptWithMaster(encrypted.substring(3), "TrailNoteEntries:master:v2");
-                saveEntries(plain);
-                return plain;
+        } else {
+            if (encrypted.startsWith("M2.") || encrypted.startsWith(MASTER_PREFIX)) {
+                throw new SecurityException("PIN metadata is missing for a protected vault");
             }
-            String plain = decryptLocalDirect(encrypted);
-            saveEntries(plain);
-            return plain;
+            plain = decryptLocalDirect(encrypted);
         }
-        if (encrypted.startsWith("M2.") || encrypted.startsWith(MASTER_PREFIX)) {
-            throw new SecurityException("PIN metadata is missing for a protected vault");
-        }
-        return decryptLocalDirect(encrypted);
+        saveEntries(plain); // authenticated migration to H4
+        return plain;
     }
 
     void saveEntries(String json) throws Exception {
-        String packed;
-        if (hasPin()) {
-            requireUnlocked();
-            packed = MASTER_PREFIX + encryptWithMaster(json, "SecurityPlantEntries:master:v3");
-        } else {
-            packed = encryptLocalDirect(json);
-        }
+        if (hasPin()) requireUnlocked();
+        String packed = HIERARCHY_PREFIX + encryptHierarchyEnvelope(json);
         if (!secureDataPrefs.edit().putString(KEY_ENTRIES, packed).commit()) {
             throw new IllegalStateException("暗号化データを書き込めませんでした");
         }
     }
 
-    boolean hasEncryptedData() {
-        return secureDataPrefs.contains(KEY_ENTRIES);
+    boolean hasEncryptedData() { return secureDataPrefs.contains(KEY_ENTRIES); }
+
+    boolean hierarchyConfigured() {
+        String value = secureDataPrefs.getString(KEY_ENTRIES, "");
+        return value.startsWith(HIERARCHY_PREFIX);
     }
 
     String summary() {
-        return hasPin()
-                ? "Security Plant dual-key AES-256-GCM / strengthened PIN KDF + Android Keystore"
-                : "Security Plant AES-256-GCM / Android Keystore / authenticated encryption";
+        return "Security Plant H4 compartmentalized AES-256-GCM / " + hardwareBackedSummary()
+                + (hasPin() ? " / PIN-wrapped root" : " / device-bound root");
+    }
+
+    String hardwareBackedSummary() {
+        try {
+            SecretKey key = getOrCreateHardwareKey();
+            boolean secure = false;
+            try {
+                SecretKeyFactory factory = SecretKeyFactory.getInstance(key.getAlgorithm(), KEYSTORE);
+                KeyInfo info = (KeyInfo) factory.getKeySpec(key, KeyInfo.class);
+                secure = info.isInsideSecureHardware();
+            } catch (Exception ignored) {
+            }
+            String mode = securityPrefs.getString(KEY_HW_MODE, "ANDROID_KEYSTORE");
+            return mode + (secure ? "/HW" : "/KEYSTORE");
+        } catch (Exception e) {
+            return "KEYSTORE_UNAVAILABLE";
+        }
     }
 
     String encryptBackup(String json, String passphrase) throws Exception {
@@ -254,11 +290,11 @@ final class CryptoPlant {
             SecretKeySpec key = new SecretKeySpec(keyBytes, "AES");
             Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
             cipher.init(Cipher.ENCRYPT_MODE, key, new GCMParameterSpec(GCM_TAG_BITS, iv));
-            cipher.updateAAD("SecurityContainerPlantBackup:v3".getBytes(StandardCharsets.UTF_8));
+            cipher.updateAAD("SecurityContainerPlantBackup:v4".getBytes(StandardCharsets.UTF_8));
             byte[] ct = cipher.doFinal(json.getBytes(StandardCharsets.UTF_8));
             JSONObject envelope = new JSONObject();
             envelope.put("format", "TrailNoteSecurityPlant");
-            envelope.put("version", 3);
+            envelope.put("version", 4);
             envelope.put("kdf", "PBKDF2WithHmacSHA256");
             envelope.put("iterations", BACKUP_ITERATIONS);
             envelope.put("cipher", "AES-256-GCM");
@@ -274,22 +310,20 @@ final class CryptoPlant {
     String decryptBackup(String envelopeText, String passphrase) throws Exception {
         JSONObject envelope = new JSONObject(envelopeText);
         String format = envelope.optString("format");
-        if ("TrailNoteVault".equals(format)) return decryptLegacyBackup(envelope, passphrase);
+        if ("TrailNoteVault".equals(format)) return decryptBackupEnvelope(envelope, passphrase,
+                envelope.optInt("iterations", LEGACY_WRAP_ITERATIONS), "TrailNoteBackup:v2");
         if (!"TrailNoteSecurityPlant".equals(format)) {
             throw new IllegalArgumentException("TrailNote Security Plantバックアップではありません");
         }
         int iterations = envelope.optInt("iterations", BACKUP_ITERATIONS);
         if (iterations < 100_000 || iterations > 1_000_000) throw new IllegalArgumentException("KDF設定が不正です");
-        return decryptBackupEnvelope(envelope, passphrase, iterations, "SecurityContainerPlantBackup:v3");
-    }
-
-    private String decryptLegacyBackup(JSONObject envelope, String passphrase) throws Exception {
-        int iterations = envelope.optInt("iterations", LEGACY_WRAP_ITERATIONS);
-        if (iterations < 100_000 || iterations > 1_000_000) throw new IllegalArgumentException("KDF設定が不正です");
-        return decryptBackupEnvelope(envelope, passphrase, iterations, "TrailNoteBackup:v2");
+        int version = envelope.optInt("version", 3);
+        return decryptBackupEnvelope(envelope, passphrase, iterations,
+                version >= 4 ? "SecurityContainerPlantBackup:v4" : "SecurityContainerPlantBackup:v3");
     }
 
     private String decryptBackupEnvelope(JSONObject envelope, String passphrase, int iterations, String aad) throws Exception {
+        if (iterations < 100_000 || iterations > 1_000_000) throw new IllegalArgumentException("KDF設定が不正です");
         byte[] salt = unb64(envelope.getString("salt"));
         byte[] iv = unb64(envelope.getString("iv"));
         byte[] ct = unb64(envelope.getString("ciphertext"));
@@ -305,12 +339,120 @@ final class CryptoPlant {
         }
     }
 
-    private void migrateLegacyMasterPrefixIfNeeded() throws Exception {
-        String encrypted = secureDataPrefs.getString(KEY_ENTRIES, null);
-        if (encrypted != null && encrypted.startsWith("M2.")) {
-            String plain = decryptWithMaster(encrypted.substring(3), "TrailNoteEntries:master:v2");
-            saveEntries(plain);
+    private String encryptHierarchyEnvelope(String workspaceJson) throws Exception {
+        JSONObject root;
+        String trimmed = workspaceJson == null ? "" : workspaceJson.trim();
+        if (trimmed.startsWith("[")) {
+            root = new JSONObject();
+            root.put("schema", 3);
+            root.put("logs", new JSONArray(trimmed));
+            for (String domain : DOMAINS) if (!root.has(domain)) root.put(domain, new JSONArray());
+        } else {
+            root = new JSONObject(trimmed);
         }
+
+        JSONObject meta = new JSONObject();
+        Iterator<String> keys = root.keys();
+        while (keys.hasNext()) {
+            String key = keys.next();
+            if (!isDomain(key)) meta.put(key, root.get(key));
+        }
+
+        JSONObject envelope = new JSONObject();
+        envelope.put("format", "TrailNoteHierarchy");
+        envelope.put("version", 1);
+        envelope.put("meta", encryptRoot(meta.toString().getBytes(StandardCharsets.UTF_8), "SecurityPlantHierarchyMeta:v1"));
+        JSONObject domains = new JSONObject();
+        for (String domain : DOMAINS) {
+            JSONArray array = root.optJSONArray(domain);
+            if (array == null) array = new JSONArray();
+            byte[] dek = getOrCreateDomainKey(domain);
+            try {
+                domains.put(domain, encryptWithRawKey(array.toString().getBytes(StandardCharsets.UTF_8), dek,
+                        "SecurityPlantDomain:" + domain + ":v1"));
+            } finally {
+                Arrays.fill(dek, (byte) 0);
+            }
+        }
+        envelope.put("domains", domains);
+        return b64(envelope.toString().getBytes(StandardCharsets.UTF_8));
+    }
+
+    private String decryptHierarchyEnvelope(String encoded) throws Exception {
+        JSONObject envelope = new JSONObject(new String(unb64(encoded), StandardCharsets.UTF_8));
+        if (!"TrailNoteHierarchy".equals(envelope.optString("format")) || envelope.optInt("version") != 1) {
+            throw new SecurityException("H4 hierarchy envelope rejected");
+        }
+        byte[] metaBytes = decryptRoot(envelope.getString("meta"), "SecurityPlantHierarchyMeta:v1");
+        JSONObject root;
+        try {
+            root = new JSONObject(new String(metaBytes, StandardCharsets.UTF_8));
+        } finally {
+            Arrays.fill(metaBytes, (byte) 0);
+        }
+        JSONObject domains = envelope.getJSONObject("domains");
+        for (String domain : DOMAINS) {
+            if (!domains.has(domain)) throw new SecurityException("H4 domain missing: " + domain);
+            byte[] dek = getOrCreateDomainKey(domain);
+            byte[] plain = null;
+            try {
+                plain = decryptWithRawKey(domains.getString(domain), dek,
+                        "SecurityPlantDomain:" + domain + ":v1");
+                root.put(domain, new JSONArray(new String(plain, StandardCharsets.UTF_8)));
+            } finally {
+                Arrays.fill(dek, (byte) 0);
+                if (plain != null) Arrays.fill(plain, (byte) 0);
+            }
+        }
+        return root.toString();
+    }
+
+    private byte[] getOrCreateDomainKey(String domain) throws Exception {
+        String stored = securityPrefs.getString(DOMAIN_WRAP_PREFIX + domain, null);
+        if (stored != null) {
+            return hasPin()
+                    ? decryptWithMaster(stored, "SecurityPlantDomainDEK:" + domain + ":root:v1")
+                    : decryptWithCurrentKeystore(stored, "SecurityPlantDomainDEK:" + domain + ":device:v1");
+        }
+        byte[] dek = randomBytes(32);
+        storeDomainKey(domain, dek, hasPin());
+        return dek;
+    }
+
+    private void storeDomainKey(String domain, byte[] dek, boolean pinMode) throws Exception {
+        String wrapped = pinMode
+                ? encryptWithMaster(dek, "SecurityPlantDomainDEK:" + domain + ":root:v1")
+                : encryptWithCurrentKeystore(dek, "SecurityPlantDomainDEK:" + domain + ":device:v1");
+        if (!securityPrefs.edit().putString(DOMAIN_WRAP_PREFIX + domain, wrapped).commit()) {
+            throw new IllegalStateException("Domain key wrap commit failed: " + domain);
+        }
+    }
+
+    private List<DomainKey> readExistingDomainKeys(boolean pinMode) throws Exception {
+        List<DomainKey> result = new ArrayList<>();
+        for (String domain : DOMAINS) {
+            String stored = securityPrefs.getString(DOMAIN_WRAP_PREFIX + domain, null);
+            if (stored == null) continue;
+            byte[] key = pinMode
+                    ? decryptWithMaster(stored, "SecurityPlantDomainDEK:" + domain + ":root:v1")
+                    : decryptWithCurrentKeystore(stored, "SecurityPlantDomainDEK:" + domain + ":device:v1");
+            result.add(new DomainKey(domain, key));
+        }
+        return result;
+    }
+
+    private void migrateLegacyPayloadIfNeeded() throws Exception {
+        String encrypted = secureDataPrefs.getString(KEY_ENTRIES, null);
+        if (encrypted == null || encrypted.startsWith(HIERARCHY_PREFIX)) return;
+        String plain;
+        if (encrypted.startsWith(MASTER_PREFIX)) {
+            plain = decryptWithMaster(encrypted.substring(MASTER_PREFIX.length()), "SecurityPlantEntries:master:v3");
+        } else if (encrypted.startsWith("M2.")) {
+            plain = decryptWithMaster(encrypted.substring(3), "TrailNoteEntries:master:v2");
+        } else {
+            plain = decryptLocalDirect(encrypted);
+        }
+        saveEntries(plain);
     }
 
     private void registerFailedAttempt() {
@@ -328,46 +470,71 @@ final class CryptoPlant {
         if (sessionMasterKey == null) throw new SecurityException("Security Container Plant is locked");
     }
 
-    private String encryptWithMaster(String plaintext, String aad) throws Exception {
+    private String encryptWithMaster(byte[] plaintext, String aad) throws Exception {
         requireUnlocked();
-        return encryptWithRawKey(plaintext.getBytes(StandardCharsets.UTF_8), sessionMasterKey, aad);
+        return encryptWithRawKey(plaintext, sessionMasterKey, aad);
     }
 
-    private String decryptWithMaster(String packed, String aad) throws Exception {
+    private byte[] decryptWithMaster(String packed, String aad) throws Exception {
         requireUnlocked();
-        return new String(decryptWithRawKey(packed, sessionMasterKey, aad), StandardCharsets.UTF_8);
+        return decryptWithRawKey(packed, sessionMasterKey, aad);
+    }
+
+    private String encryptRoot(byte[] plaintext, String aad) throws Exception {
+        return hasPin() ? encryptWithMaster(plaintext, aad)
+                : encryptWithCurrentKeystore(plaintext, aad);
+    }
+
+    private byte[] decryptRoot(String packed, String aad) throws Exception {
+        return hasPin() ? decryptWithMaster(packed, aad)
+                : decryptWithCurrentKeystore(packed, aad);
     }
 
     private String encryptLocalDirect(String plaintext) throws Exception {
-        return encryptWithKeystore(plaintext.getBytes(StandardCharsets.UTF_8), "SecurityPlantLocal:direct:v3");
+        return "K2." + encryptWithCurrentKeystore(plaintext.getBytes(StandardCharsets.UTF_8), "SecurityPlantLocal:direct:v4");
     }
 
     private String decryptLocalDirect(String packed) throws Exception {
+        if (packed.startsWith("K2.")) {
+            return new String(decryptWithCurrentKeystore(packed.substring(3), "SecurityPlantLocal:direct:v4"), StandardCharsets.UTF_8);
+        }
         try {
-            return new String(decryptWithKeystore(packed, "SecurityPlantLocal:direct:v3"), StandardCharsets.UTF_8);
+            return new String(decryptWithLegacyKeystore(packed, "SecurityPlantLocal:direct:v3"), StandardCharsets.UTF_8);
         } catch (Exception first) {
-            return new String(decryptWithKeystore(packed, "TrailNoteLocal:direct:v1"), StandardCharsets.UTF_8);
+            return new String(decryptWithLegacyKeystore(packed, "TrailNoteLocal:direct:v1"), StandardCharsets.UTF_8);
         }
     }
 
-    private String encryptWithKeystore(byte[] plaintext, String aad) throws Exception {
-        SecretKey key = getOrCreateKey();
-        Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
-        // Android Keystore keys created with randomized encryption required MUST
-        // generate their own IV. Supplying a caller-generated GCM IV here causes
-        // KeyStoreException: "Caller-provided IV not permitted" on real devices.
-        cipher.init(Cipher.ENCRYPT_MODE, key);
-        cipher.updateAAD(aad.getBytes(StandardCharsets.UTF_8));
-        byte[] ciphertext = cipher.doFinal(plaintext);
-        byte[] iv = cipher.getIV();
-        if (iv == null || iv.length < 12) throw new SecurityException("Android Keystore did not provide a valid GCM IV");
-        return b64(iv) + "." + b64(ciphertext);
+    private String encryptWithCurrentKeystore(byte[] plaintext, String aad) throws Exception {
+        return encryptWithKeystore(getOrCreateHardwareKey(), plaintext, aad);
     }
 
-    private byte[] decryptWithKeystore(String packed, String aad) throws Exception {
+    private byte[] decryptWithCurrentKeystore(String packed, String aad) throws Exception {
+        return decryptWithKeystore(getOrCreateHardwareKey(), packed, aad);
+    }
+
+    private String encryptWithLegacyKeystore(byte[] plaintext, String aad) throws Exception {
+        return encryptWithKeystore(getOrCreateLegacyKey(), plaintext, aad);
+    }
+
+    private byte[] decryptWithLegacyKeystore(String packed, String aad) throws Exception {
+        return decryptWithKeystore(getOrCreateLegacyKey(), packed, aad);
+    }
+
+    private String encryptWithKeystore(SecretKey key, byte[] plaintext, String aad) throws Exception {
+        Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+        // Android Keystore owns IV generation for randomized GCM encryption.
+        cipher.init(Cipher.ENCRYPT_MODE, key);
+        cipher.updateAAD(aad.getBytes(StandardCharsets.UTF_8));
+        byte[] ct = cipher.doFinal(plaintext);
+        byte[] iv = cipher.getIV();
+        if (iv == null || iv.length < 12) throw new SecurityException("Keystore did not supply a valid GCM IV");
+        return b64(iv) + "." + b64(ct);
+    }
+
+    private byte[] decryptWithKeystore(SecretKey key, String packed, String aad) throws Exception {
         String[] parts = packed.split("\\.", 2);
         if (parts.length != 2) throw new IllegalArgumentException("暗号化データ形式が不正です");
-        SecretKey key = getOrCreateKey();
         Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
         cipher.init(Cipher.DECRYPT_MODE, key, new GCMParameterSpec(GCM_TAG_BITS, unb64(parts[0])));
         cipher.updateAAD(aad.getBytes(StandardCharsets.UTF_8));
@@ -393,13 +560,46 @@ final class CryptoPlant {
         return cipher.doFinal(unb64(parts[1]));
     }
 
-    private SecretKey getOrCreateKey() throws Exception {
+    private SecretKey getOrCreateHardwareKey() throws Exception {
+        KeyStore ks = KeyStore.getInstance(KEYSTORE);
+        ks.load(null);
+        KeyStore.Entry existing = ks.getEntry(HARDWARE_KEY_ALIAS, null);
+        if (existing instanceof KeyStore.SecretKeyEntry) return ((KeyStore.SecretKeyEntry) existing).getSecretKey();
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            try {
+                SecretKey key = generateHardwareKey(true);
+                securityPrefs.edit().putString(KEY_HW_MODE, "STRONGBOX").commit();
+                return key;
+            } catch (StrongBoxUnavailableException | ProviderException e) {
+                // Explicitly permitted fallback: Android Keystore backed by TEE when available.
+            }
+        }
+        SecretKey key = generateHardwareKey(false);
+        securityPrefs.edit().putString(KEY_HW_MODE, "TEE_FALLBACK").commit();
+        return key;
+    }
+
+    private SecretKey generateHardwareKey(boolean strongBox) throws Exception {
+        KeyGenerator generator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, KEYSTORE);
+        KeyGenParameterSpec.Builder builder = new KeyGenParameterSpec.Builder(HARDWARE_KEY_ALIAS,
+                KeyProperties.PURPOSE_ENCRYPT | KeyProperties.PURPOSE_DECRYPT)
+                .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                .setKeySize(256)
+                .setRandomizedEncryptionRequired(true);
+        if (strongBox && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) builder.setIsStrongBoxBacked(true);
+        generator.init(builder.build());
+        return generator.generateKey();
+    }
+
+    private SecretKey getOrCreateLegacyKey() throws Exception {
         KeyStore keyStore = KeyStore.getInstance(KEYSTORE);
         keyStore.load(null);
-        KeyStore.Entry entry = keyStore.getEntry(KEY_ALIAS, null);
+        KeyStore.Entry entry = keyStore.getEntry(LEGACY_KEY_ALIAS, null);
         if (entry instanceof KeyStore.SecretKeyEntry) return ((KeyStore.SecretKeyEntry) entry).getSecretKey();
         KeyGenerator generator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, KEYSTORE);
-        generator.init(new KeyGenParameterSpec.Builder(KEY_ALIAS,
+        generator.init(new KeyGenParameterSpec.Builder(LEGACY_KEY_ALIAS,
                 KeyProperties.PURPOSE_ENCRYPT | KeyProperties.PURPOSE_DECRYPT)
                 .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
                 .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
@@ -425,9 +625,12 @@ final class CryptoPlant {
         return out;
     }
 
-    private static boolean isValidPin(String pin) {
-        return pin != null && pin.matches("\\d{6,12}");
+    private static boolean isDomain(String key) {
+        for (String domain : DOMAINS) if (domain.equals(key)) return true;
+        return false;
     }
+
+    private static boolean isValidPin(String pin) { return pin != null && pin.matches("\\d{6,12}"); }
 
     private static boolean constantTimeEquals(byte[] a, byte[] b) {
         if (a == null || b == null || a.length != b.length) return false;
@@ -436,11 +639,12 @@ final class CryptoPlant {
         return diff == 0;
     }
 
-    private static String b64(byte[] data) {
-        return Base64.encodeToString(data, Base64.NO_WRAP);
-    }
+    private static String b64(byte[] data) { return Base64.encodeToString(data, Base64.NO_WRAP); }
+    private static byte[] unb64(String text) { return Base64.decode(text, Base64.NO_WRAP); }
 
-    private static byte[] unb64(String text) {
-        return Base64.decode(text, Base64.NO_WRAP);
+    private static final class DomainKey {
+        final String domain;
+        final byte[] bytes;
+        DomainKey(String domain, byte[] bytes) { this.domain = domain; this.bytes = bytes; }
     }
 }
