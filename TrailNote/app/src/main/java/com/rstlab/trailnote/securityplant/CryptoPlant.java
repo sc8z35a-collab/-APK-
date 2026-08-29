@@ -128,7 +128,6 @@ final class CryptoPlant {
             securityPrefs.edit().putInt(KEY_FAILED, 0).putLong(KEY_LOCK_UNTIL, 0L).apply();
 
             if (version < 3) {
-                // Re-wrap the same in-memory master key with stronger v3 KDF metadata.
                 writePinMetadata(pin, PIN_ITERATIONS, WRAP_ITERATIONS, 3,
                         "SecurityPlantMaster:pin:v3", "SecurityPlantMaster:keystore:v3");
             }
@@ -353,11 +352,16 @@ final class CryptoPlant {
 
     private String encryptWithKeystore(byte[] plaintext, String aad) throws Exception {
         SecretKey key = getOrCreateKey();
-        byte[] iv = randomBytes(12);
         Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
-        cipher.init(Cipher.ENCRYPT_MODE, key, new GCMParameterSpec(GCM_TAG_BITS, iv));
+        // Android Keystore keys created with randomized encryption required MUST
+        // generate their own IV. Supplying a caller-generated GCM IV here causes
+        // KeyStoreException: "Caller-provided IV not permitted" on real devices.
+        cipher.init(Cipher.ENCRYPT_MODE, key);
         cipher.updateAAD(aad.getBytes(StandardCharsets.UTF_8));
-        return b64(iv) + "." + b64(cipher.doFinal(plaintext));
+        byte[] ciphertext = cipher.doFinal(plaintext);
+        byte[] iv = cipher.getIV();
+        if (iv == null || iv.length < 12) throw new SecurityException("Android Keystore did not provide a valid GCM IV");
+        return b64(iv) + "." + b64(ciphertext);
     }
 
     private byte[] decryptWithKeystore(String packed, String aad) throws Exception {
