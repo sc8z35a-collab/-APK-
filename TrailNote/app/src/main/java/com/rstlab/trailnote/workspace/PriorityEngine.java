@@ -18,12 +18,19 @@ public final class PriorityEngine {
         String title = spot.optString("title", "");
 
         int score = priority * 18 + rating * 9 + novelty * 8 + access * 5 - risk * 8;
+        score += clamp(spot.optInt("adaptiveOpportunity", 0), 0, 20);
+        score -= clamp(spot.optInt("adaptiveRiskPenalty", 0), 0, 30);
+
         if (filmed) score -= 55;
         if (hasActivePlan(id, title, plans)) score += 12;
         int media = linkedAssetCount(id, title, assets);
         if (media == 0) score += 8;
         else if (media >= 3) score -= 6;
         if (spot.optBoolean("favorite", false)) score += 8;
+
+        // A restriction signal is not merely another small penalty. TrailNote should
+        // not surface a potentially prohibited location as a top filming target.
+        if (spot.optBoolean("restrictedAccess", false)) score = Math.min(score, 10);
         return clamp(score, 0, 100);
     }
 
