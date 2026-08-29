@@ -2,14 +2,10 @@ plugins {
     id 'com.android.application'
 }
 
-def signingStoreFile = System.getenv('TRAILNOTE_SIGNING_STORE_FILE')
-def signingStorePassword = System.getenv('TRAILNOTE_SIGNING_STORE_PASSWORD')
-def signingKeyAlias = System.getenv('TRAILNOTE_SIGNING_KEY_ALIAS')
-def signingKeyPassword = System.getenv('TRAILNOTE_SIGNING_KEY_PASSWORD')
 def rawTrustedCert = System.getenv('TRAILNOTE_TRUSTED_CERT_SHA256') ?: ''
 def trustedCertSha256 = rawTrustedCert.replaceAll('[^0-9A-Fa-f]', '').toLowerCase()
-def hasProductionSigning = [signingStoreFile, signingStorePassword, signingKeyAlias, signingKeyPassword]
-        .every { it != null && !it.trim().isEmpty() }
+def hsmSigningBoundary = (System.getenv('TRAILNOTE_HSM_SIGNING') ?: '') == '1'
+def forbiddenFileKeystore = System.getenv('TRAILNOTE_SIGNING_STORE_FILE')
 
 android {
     namespace 'com.rstlab.trailnote'
@@ -23,23 +19,10 @@ android {
         applicationId 'com.rstlab.trailnote'
         minSdk 26
         targetSdk 35
-        versionCode 9
-        versionName '3.5.1'
+        versionCode 10
+        versionName '4.0.0'
         buildConfigField 'String', 'DISTRIBUTION_TRUST_MODE', '"diagnostic"'
         buildConfigField 'String', 'TRUSTED_SIGNING_CERT_SHA256', '""'
-    }
-
-    signingConfigs {
-        if (hasProductionSigning) {
-            production {
-                storeFile file(signingStoreFile)
-                storePassword signingStorePassword
-                keyAlias signingKeyAlias
-                keyPassword signingKeyPassword
-                enableV1Signing false
-                enableV2Signing true
-            }
-        }
     }
 
     buildTypes {
@@ -52,13 +35,14 @@ android {
         }
 
         release {
+            // Intentionally UNSIGNED in Gradle. Production signing is performed only by
+            // a non-exportable HSM/PKCS#11 key on the dedicated signing runner.
             debuggable false
             minifyEnabled true
             shrinkResources true
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
             buildConfigField 'String', 'DISTRIBUTION_TRUST_MODE', '"production"'
             buildConfigField 'String', 'TRUSTED_SIGNING_CERT_SHA256', "\"${trustedCertSha256}\""
-            if (hasProductionSigning) signingConfig signingConfigs.production
         }
 
         hardened {
@@ -83,11 +67,17 @@ android {
 
 def verifyProductionTrustConfig = tasks.register('verifyProductionTrustConfig') {
     group = 'verification'
-    description = 'Fail closed unless production signing identity and certificate pin are configured.'
+    description = 'Fail closed unless production is being prepared for a non-exportable HSM signing boundary.'
     doLast {
-        if (!hasProductionSigning) throw new GradleException('Production build refused: dedicated signing keystore credentials are not configured.')
-        if (trustedCertSha256.size() != 64) throw new GradleException('Production build refused: TRAILNOTE_TRUSTED_CERT_SHA256 must be one SHA-256 fingerprint (64 hex chars).')
-        if (!file(signingStoreFile).isFile()) throw new GradleException('Production build refused: signing keystore file is missing.')
+        if (!hsmSigningBoundary) {
+            throw new GradleException('Production build refused: TRAILNOTE_HSM_SIGNING=1 is required; file-keystore production signing is disabled.')
+        }
+        if (forbiddenFileKeystore != null && !forbiddenFileKeystore.trim().isEmpty()) {
+            throw new GradleException('Production build refused: exportable file keystore input is forbidden in HSM mode.')
+        }
+        if (trustedCertSha256.size() != 64) {
+            throw new GradleException('Production build refused: TRAILNOTE_TRUSTED_CERT_SHA256 must be one SHA-256 fingerprint (64 hex chars).')
+        }
     }
 }
 
