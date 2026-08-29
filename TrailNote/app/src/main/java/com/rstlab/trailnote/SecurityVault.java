@@ -22,12 +22,14 @@ import javax.crypto.spec.PBEKeySpec;
 import javax.crypto.spec.SecretKeySpec;
 
 /**
- * Independent local security layer for TrailNote.
+ * TrailNote local vault.
  *
- * - AES-256-GCM key lives in Android Keystore.
- * - App PIN is stored only as PBKDF2-HMAC-SHA256(salt, pin).
- * - Failed PIN attempts trigger an exponential temporary lockout.
- * - Backup files are independently encrypted with a user passphrase.
+ * PIN enabled mode is dual-key:
+ * 1) random 256-bit master key encrypts the log with AES-GCM;
+ * 2) Android Keystore AES key wraps that master key;
+ * 3) a separately salted PIN-derived AES key wraps the Keystore-wrapped blob.
+ *
+ * Unlock therefore needs both the PIN-derived key and the device/app Keystore key.
  */
 public final class SecurityVault {
     private static final String KEYSTORE = "AndroidKeyStore";
@@ -37,15 +39,20 @@ public final class SecurityVault {
     private static final String KEY_ENTRIES = "entries_enc";
     private static final String KEY_PIN_SALT = "pin_salt";
     private static final String KEY_PIN_HASH = "pin_hash";
+    private static final String KEY_WRAP_SALT = "wrap_salt";
+    private static final String KEY_MASTER_WRAP = "master_wrap";
     private static final String KEY_FAILED = "failed_attempts";
     private static final String KEY_LOCK_UNTIL = "lock_until";
-    private static final int PIN_ITERATIONS = 140_000;
-    private static final int BACKUP_ITERATIONS = 180_000;
+    private static final String MASTER_PREFIX = "M2.";
+    private static final int PIN_ITERATIONS = 160_000;
+    private static final int WRAP_ITERATIONS = 220_000;
+    private static final int BACKUP_ITERATIONS = 220_000;
     private static final int GCM_TAG_BITS = 128;
 
     private final SharedPreferences securityPrefs;
     private final SharedPreferences secureDataPrefs;
     private final SecureRandom random = new SecureRandom();
+    private byte[] sessionMasterKey;
 
     public SecurityVault(Context context) {
         securityPrefs = context.getSharedPreferences(PREF_SECURITY, Context.MODE_PRIVATE);
@@ -53,20 +60,49 @@ public final class SecurityVault {
     }
 
     public boolean hasPin() {
-        return securityPrefs.contains(KEY_PIN_SALT) && securityPrefs.contains(KEY_PIN_HASH);
+        return securityPrefs.contains(KEY_PIN_SALT)
+                && securityPrefs.contains(KEY_PIN_HASH)
+                && securityPrefs.contains(KEY_WRAP_SALT)
+                && securityPrefs.contains(KEY_MASTER_WRAP);
     }
 
     public void setPin(String pin) throws Exception {
         if (!isValidPin(pin)) throw new IllegalArgumentException("PINは6〜12桁で設定してください");
-        byte[] salt = randomBytes(16);
-        byte[] hash = pbkdf2(pin.toCharArray(), salt, PIN_ITERATIONS, 32);
+        boolean changing = hasPin();
+        String existingDirectCipher = null;
+        if (changing) {
+            if (sessionMasterKey == null) throw new SecurityException("PIN変更前にVaultを解除してください");
+        } else {
+            sessionMasterKey = randomBytes(32);
+            String current = secureDataPrefs.getString(KEY_ENTRIES, null);
+            if (current != null && !current.startsWith(MASTER_PREFIX)) existingDirectCipher = current;
+        }
+
+        byte[] verifySalt = randomBytes(16);
+        byte[] verifyHash = pbkdf2(pin.toCharArray(), verifySalt, PIN_ITERATIONS, 32);
+        byte[] wrapSalt = randomBytes(16);
+        byte[] pinWrapKey = pbkdf2(pin.toCharArray(), wrapSalt, WRAP_ITERATIONS, 32);
+        String keystoreWrappedMaster = encryptWithKeystore(sessionMasterKey, "TrailNoteMasterWrap:keystore:v2");
+        String pinWrappedMaster = encryptWithRawKey(
+                keystoreWrappedMaster.getBytes(StandardCharsets.UTF_8),
+                pinWrapKey,
+                "TrailNoteMasterWrap:pin:v2");
+
         securityPrefs.edit()
-                .putString(KEY_PIN_SALT, b64(salt))
-                .putString(KEY_PIN_HASH, b64(hash))
+                .putString(KEY_PIN_SALT, b64(verifySalt))
+                .putString(KEY_PIN_HASH, b64(verifyHash))
+                .putString(KEY_WRAP_SALT, b64(wrapSalt))
+                .putString(KEY_MASTER_WRAP, pinWrappedMaster)
                 .putInt(KEY_FAILED, 0)
                 .putLong(KEY_LOCK_UNTIL, 0L)
-                .apply();
-        Arrays.fill(hash, (byte) 0);
+                .commit();
+        Arrays.fill(verifyHash, (byte) 0);
+        Arrays.fill(pinWrapKey, (byte) 0);
+
+        if (!changing && existingDirectCipher != null) {
+            String plain = decryptLocalDirect(existingDirectCipher);
+            saveEntries(plain);
+        }
     }
 
     public boolean verifyPin(String pin) throws Exception {
@@ -77,12 +113,44 @@ public final class SecurityVault {
         byte[] actual = pbkdf2(pin.toCharArray(), salt, PIN_ITERATIONS, expected.length);
         boolean ok = constantTimeEquals(expected, actual);
         Arrays.fill(actual, (byte) 0);
-        if (ok) {
+        if (!ok) {
+            registerFailedAttempt();
+            return false;
+        }
+
+        byte[] wrapSalt = unb64(securityPrefs.getString(KEY_WRAP_SALT, ""));
+        byte[] pinWrapKey = pbkdf2(pin.toCharArray(), wrapSalt, WRAP_ITERATIONS, 32);
+        try {
+            byte[] keystoreWrappedBytes = decryptWithRawKey(
+                    securityPrefs.getString(KEY_MASTER_WRAP, ""),
+                    pinWrapKey,
+                    "TrailNoteMasterWrap:pin:v2");
+            byte[] master = decryptWithKeystore(
+                    new String(keystoreWrappedBytes, StandardCharsets.UTF_8),
+                    "TrailNoteMasterWrap:keystore:v2");
+            if (master.length != 32) throw new SecurityException("Vault master key length mismatch");
+            lockSession();
+            sessionMasterKey = master;
             securityPrefs.edit().putInt(KEY_FAILED, 0).putLong(KEY_LOCK_UNTIL, 0L).apply();
             return true;
+        } catch (Exception e) {
+            registerFailedAttempt();
+            lockSession();
+            return false;
+        } finally {
+            Arrays.fill(pinWrapKey, (byte) 0);
         }
-        registerFailedAttempt();
-        return false;
+    }
+
+    public void lockSession() {
+        if (sessionMasterKey != null) {
+            Arrays.fill(sessionMasterKey, (byte) 0);
+            sessionMasterKey = null;
+        }
+    }
+
+    public boolean isSessionUnlocked() {
+        return !hasPin() || sessionMasterKey != null;
     }
 
     public boolean isLockedOut() {
@@ -102,29 +170,44 @@ public final class SecurityVault {
         long until = 0L;
         if (failed >= 5) {
             int stage = Math.min(4, failed - 5);
-            long seconds = 30L * (1L << stage); // 30s, 60s, 120s, 240s, 480s max progression
+            long seconds = 30L * (1L << stage);
             until = System.currentTimeMillis() + Math.min(seconds, 480L) * 1000L;
         }
         securityPrefs.edit().putInt(KEY_FAILED, failed).putLong(KEY_LOCK_UNTIL, until).apply();
     }
 
-    public String loadEntries(SharedPreferences legacyPrefs, String legacyKey) {
-        try {
-            String encrypted = secureDataPrefs.getString(KEY_ENTRIES, null);
-            if (encrypted != null) return decryptLocal(encrypted);
-
-            // One-time migration from v1.x plaintext SharedPreferences.
+    public String loadEntries(SharedPreferences legacyPrefs, String legacyKey) throws Exception {
+        String encrypted = secureDataPrefs.getString(KEY_ENTRIES, null);
+        if (encrypted == null) {
             String legacy = legacyPrefs.getString(legacyKey, "[]");
             saveEntries(legacy);
             legacyPrefs.edit().remove(legacyKey).apply();
             return legacy;
-        } catch (Exception e) {
-            return "[]";
         }
+        if (hasPin()) {
+            requireUnlocked();
+            if (encrypted.startsWith(MASTER_PREFIX)) {
+                return decryptWithMaster(encrypted.substring(MASTER_PREFIX.length()));
+            }
+            String plain = decryptLocalDirect(encrypted);
+            saveEntries(plain);
+            return plain;
+        }
+        if (encrypted.startsWith(MASTER_PREFIX)) {
+            throw new SecurityException("PIN metadata is missing for a protected vault");
+        }
+        return decryptLocalDirect(encrypted);
     }
 
     public void saveEntries(String json) throws Exception {
-        secureDataPrefs.edit().putString(KEY_ENTRIES, encryptLocal(json)).apply();
+        String packed;
+        if (hasPin()) {
+            requireUnlocked();
+            packed = MASTER_PREFIX + encryptWithMaster(json);
+        } else {
+            packed = encryptLocalDirect(json);
+        }
+        secureDataPrefs.edit().putString(KEY_ENTRIES, packed).commit();
     }
 
     public boolean hasEncryptedData() {
@@ -132,7 +215,9 @@ public final class SecurityVault {
     }
 
     public String securitySummary() {
-        return "AES-256-GCM / Android Keystore / PBKDF2-SHA256 / GCM tag 128-bit";
+        return hasPin()
+                ? "Dual-key AES-256-GCM / PIN + Android Keystore / authenticated encryption"
+                : "AES-256-GCM / Android Keystore / authenticated encryption";
     }
 
     public String encryptBackup(String json, String passphrase) throws Exception {
@@ -148,7 +233,6 @@ public final class SecurityVault {
         cipher.updateAAD("TrailNoteBackup:v2".getBytes(StandardCharsets.UTF_8));
         byte[] ct = cipher.doFinal(json.getBytes(StandardCharsets.UTF_8));
         Arrays.fill(keyBytes, (byte) 0);
-
         JSONObject envelope = new JSONObject();
         envelope.put("format", "TrailNoteVault");
         envelope.put("version", 2);
@@ -183,17 +267,39 @@ public final class SecurityVault {
         return new String(plain, StandardCharsets.UTF_8);
     }
 
-    private String encryptLocal(String plaintext) throws Exception {
+    private void requireUnlocked() {
+        if (sessionMasterKey == null) throw new SecurityException("TrailNote Vault is locked");
+    }
+
+    private String encryptWithMaster(String plaintext) throws Exception {
+        requireUnlocked();
+        return encryptWithRawKey(plaintext.getBytes(StandardCharsets.UTF_8), sessionMasterKey, "TrailNoteEntries:master:v2");
+    }
+
+    private String decryptWithMaster(String packed) throws Exception {
+        requireUnlocked();
+        return new String(decryptWithRawKey(packed, sessionMasterKey, "TrailNoteEntries:master:v2"), StandardCharsets.UTF_8);
+    }
+
+    private String encryptLocalDirect(String plaintext) throws Exception {
+        return encryptWithKeystore(plaintext.getBytes(StandardCharsets.UTF_8), "TrailNoteLocal:direct:v1");
+    }
+
+    private String decryptLocalDirect(String packed) throws Exception {
+        return new String(decryptWithKeystore(packed, "TrailNoteLocal:direct:v1"), StandardCharsets.UTF_8);
+    }
+
+    private String encryptWithKeystore(byte[] plaintext, String aad) throws Exception {
         SecretKey key = getOrCreateKey();
         byte[] iv = randomBytes(12);
         Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
         cipher.init(Cipher.ENCRYPT_MODE, key, new GCMParameterSpec(GCM_TAG_BITS, iv));
-        cipher.updateAAD("TrailNoteLocal:v1".getBytes(StandardCharsets.UTF_8));
-        byte[] ciphertext = cipher.doFinal(plaintext.getBytes(StandardCharsets.UTF_8));
+        cipher.updateAAD(aad.getBytes(StandardCharsets.UTF_8));
+        byte[] ciphertext = cipher.doFinal(plaintext);
         return b64(iv) + "." + b64(ciphertext);
     }
 
-    private String decryptLocal(String packed) throws Exception {
+    private byte[] decryptWithKeystore(String packed, String aad) throws Exception {
         String[] parts = packed.split("\\.", 2);
         if (parts.length != 2) throw new IllegalArgumentException("暗号化データ形式が不正です");
         SecretKey key = getOrCreateKey();
@@ -201,8 +307,28 @@ public final class SecurityVault {
         byte[] ciphertext = unb64(parts[1]);
         Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
         cipher.init(Cipher.DECRYPT_MODE, key, new GCMParameterSpec(GCM_TAG_BITS, iv));
-        cipher.updateAAD("TrailNoteLocal:v1".getBytes(StandardCharsets.UTF_8));
-        return new String(cipher.doFinal(ciphertext), StandardCharsets.UTF_8);
+        cipher.updateAAD(aad.getBytes(StandardCharsets.UTF_8));
+        return cipher.doFinal(ciphertext);
+    }
+
+    private String encryptWithRawKey(byte[] plaintext, byte[] keyBytes, String aad) throws Exception {
+        byte[] iv = randomBytes(12);
+        SecretKeySpec key = new SecretKeySpec(keyBytes, "AES");
+        Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+        cipher.init(Cipher.ENCRYPT_MODE, key, new GCMParameterSpec(GCM_TAG_BITS, iv));
+        cipher.updateAAD(aad.getBytes(StandardCharsets.UTF_8));
+        byte[] ciphertext = cipher.doFinal(plaintext);
+        return b64(iv) + "." + b64(ciphertext);
+    }
+
+    private byte[] decryptWithRawKey(String packed, byte[] keyBytes, String aad) throws Exception {
+        String[] parts = packed.split("\\.", 2);
+        if (parts.length != 2) throw new IllegalArgumentException("暗号化データ形式が不正です");
+        SecretKeySpec key = new SecretKeySpec(keyBytes, "AES");
+        Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+        cipher.init(Cipher.DECRYPT_MODE, key, new GCMParameterSpec(GCM_TAG_BITS, unb64(parts[0])));
+        cipher.updateAAD(aad.getBytes(StandardCharsets.UTF_8));
+        return cipher.doFinal(unb64(parts[1]));
     }
 
     private SecretKey getOrCreateKey() throws Exception {
