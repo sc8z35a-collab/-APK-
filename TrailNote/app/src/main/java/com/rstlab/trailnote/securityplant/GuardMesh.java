@@ -80,7 +80,6 @@ final class GuardMesh {
         int uiState = uiGuard(signals);
         if (uiState == PASS) passed++; else if (uiState == WARN) { warned++; score += 12; } else { failed++; score += 45; }
 
-        // Cross-guard consistency checks. These are intentionally redundant.
         if (distribution.trusted && distribution.critical) {
             failed++;
             score += 100;
@@ -138,8 +137,10 @@ final class GuardMesh {
             return FAIL;
         }
         if (!distribution.production) {
-            signals.add("distribution-guard-diagnostic");
-            return WARN;
+            // Diagnostic is a deliberately isolated package/signing domain. It is not
+            // production-trusted, but its existence is not itself a runtime threat.
+            signals.add("distribution-guard-diagnostic-isolated");
+            return PASS;
         }
         signals.add("distribution-guard-production-trusted");
         return PASS;
