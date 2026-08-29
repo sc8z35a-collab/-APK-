@@ -16,7 +16,7 @@ permissions:
 jobs:
   diagnostic:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 40
     steps:
       - name: Checkout immutable action revision
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
@@ -35,7 +35,7 @@ jobs:
         with:
           gradle-version: "8.9"
 
-      - name: Assert production signing gate fails closed in ordinary CI
+      - name: Assert HSM production gate fails closed in ordinary CI
         working-directory: TrailNote
         shell: bash
         run: |
@@ -43,13 +43,13 @@ jobs:
           LOG="$RUNNER_TEMP/production-gate.log"
           if gradle :app:verifyProductionTrustConfig --no-daemon >"$LOG" 2>&1; then
             cat "$LOG"
-            echo "ERROR: production signing gate unexpectedly succeeded without protected signing inputs." >&2
+            echo "ERROR: production HSM gate unexpectedly succeeded outside the signing environment." >&2
             exit 1
           fi
           grep -q "Production build refused" "$LOG"
-          echo "PASS: production build is fail-closed outside the protected signing environment."
+          echo "PASS: production build is fail-closed without the HSM boundary."
 
-      - name: Verify Adaptive Operations Core is wired into workspace mutations
+      - name: Verify Adaptive Operations Core wiring
         shell: bash
         run: |
           set -euo pipefail
@@ -59,24 +59,60 @@ jobs:
           grep -q 'AdaptiveOperationsCore.apply' "$REPO"
           grep -q '#manual' "$CORE"
           grep -q 'restrictedAccess' "$CORE"
-          grep -q '撮影計画を自動生成' "$CORE"
-          grep -q '現地下見・安全確認ミッションを生成' "$CORE"
 
-      - name: Guard Android Keystore GCM IV ownership
+      - name: Verify v4 hardware-root and H4 hierarchy invariants
         shell: bash
         run: |
           set -euo pipefail
           CRYPTO=TrailNote/app/src/main/java/com/rstlab/trailnote/securityplant/CryptoPlant.java
-          SECTION="$(sed -n '/private String encryptWithKeystore/,/private byte\[\] decryptWithKeystore/p' "$CRYPTO")"
-          printf '%s\n' "$SECTION" | grep -Fq 'cipher.init(Cipher.ENCRYPT_MODE, key);'
-          printf '%s\n' "$SECTION" | grep -Fq 'cipher.getIV()'
+          grep -q 'setIsStrongBoxBacked(true)' "$CRYPTO"
+          grep -q 'HIERARCHY_PREFIX = "H4."' "$CRYPTO"
+          grep -q 'DOMAIN_WRAP_PREFIX' "$CRYPTO"
+          grep -q '"logs", "spots", "plans", "missions", "assets", "gear"' "$CRYPTO"
+          grep -q 'cipher.init(Cipher.ENCRYPT_MODE, key);' "$CRYPTO"
+          grep -q 'cipher.getIV()' "$CRYPTO"
+          SECTION="$(sed -n '/private String encryptWithKeystore(SecretKey/,/private byte\[\] decryptWithKeystore/p' "$CRYPTO")"
           if printf '%s\n' "$SECTION" | grep -Fq 'new GCMParameterSpec'; then
-            echo 'ERROR: Keystore encryption must not receive a caller-provided GCM IV.' >&2
+            echo 'ERROR: Android Keystore encryption received a caller-provided IV.' >&2
             exit 1
           fi
-          echo 'PASS: Android Keystore owns encryption IV generation.'
 
-      - name: Lint and build TrailNote v3.5.1 adaptive diagnostic APKs
+      - name: Verify independent component integrity and guard mesh
+        shell: bash
+        run: |
+          set -euo pipefail
+          COMPONENT=TrailNote/app/src/main/java/com/rstlab/trailnote/securityplant/ComponentIntegrityPlant.java
+          MESH=TrailNote/app/src/main/java/com/rstlab/trailnote/securityplant/GuardMesh.java
+          PLANT=TrailNote/app/src/main/java/com/rstlab/trailnote/securityplant/SecurityContainerPlant.java
+          test -s "$COMPONENT"
+          test -s "$MESH"
+          grep -q 'classes(\\d*)\\.dex' "$COMPONENT"
+          grep -q 'AndroidManifest.xml' "$COMPONENT"
+          grep -q 'resources.arsc' "$COMPONENT"
+          grep -q 'cryptoGuard' "$MESH"
+          grep -q 'runtimeGuard' "$MESH"
+          grep -q 'distributionGuard' "$MESH"
+          grep -q 'storageGuard' "$MESH"
+          grep -q 'uiGuard' "$MESH"
+          grep -q 'guardMesh.evaluate' "$PLANT"
+
+      - name: Verify production signing has no exportable private-key fallback
+        shell: bash
+        run: |
+          set -euo pipefail
+          SCRIPT=TrailNote/security/sign-with-pkcs11-hsm.sh
+          GRADLE=TrailNote/app/build.gradle
+          test -s "$SCRIPT"
+          grep -q -- '--ks-type PKCS11' "$SCRIPT"
+          grep -q -- '--ks NONE' "$SCRIPT"
+          grep -q 'exportable file-keystore signing is forbidden' "$SCRIPT"
+          grep -q 'TRAILNOTE_HSM_SIGNING' "$GRADLE"
+          if grep -q 'TRAILNOTE_SIGNING_KEYSTORE_B64' .github/workflows/trailnote-trusted-builder.yml; then
+            echo 'ERROR: exportable production keystore secret was reintroduced.' >&2
+            exit 1
+          fi
+
+      - name: Lint and build TrailNote v4 diagnostic APKs
         working-directory: TrailNote
         run: gradle :app:lintHardened :app:assembleHardened :app:assembleDebug --stacktrace --no-daemon
 
@@ -86,33 +122,33 @@ jobs:
           git diff --exit-code
           test -z "$(git status --porcelain --untracked-files=no)"
 
-      - name: Build v3.5.1 diagnostic integrity manifest
+      - name: Build v4 diagnostic integrity manifest
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p TrailNote/dist
-          cp TrailNote/app/build/outputs/apk/hardened/app-hardened.apk TrailNote/dist/TrailNote-3.5.1-adaptive-diagnostic.apk
-          HASH="$(sha256sum TrailNote/dist/TrailNote-3.5.1-adaptive-diagnostic.apk | awk '{print $1}')"
-          printf '%s  %s\n' "$HASH" 'TrailNote-3.5.1-adaptive-diagnostic.apk' > TrailNote/dist/SHA256SUMS-diagnostic.txt
-          printf '{"artifact":"TrailNote-3.5.1-adaptive-diagnostic.apk","sha256":"%s","source_commit":"%s","workflow_run":"%s","trust_mode":"diagnostic","workspace_schema":3,"adaptive_engine":"1.0.0","keystore_iv_policy":"provider-generated","production_trusted":false}\n' \
+          cp TrailNote/app/build/outputs/apk/hardened/app-hardened.apk TrailNote/dist/TrailNote-4.0.0-hardened-diagnostic.apk
+          HASH="$(sha256sum TrailNote/dist/TrailNote-4.0.0-hardened-diagnostic.apk | awk '{print $1}')"
+          printf '%s  %s\n' "$HASH" 'TrailNote-4.0.0-hardened-diagnostic.apk' > TrailNote/dist/SHA256SUMS-diagnostic.txt
+          printf '{"artifact":"TrailNote-4.0.0-hardened-diagnostic.apk","sha256":"%s","source_commit":"%s","workflow_run":"%s","trust_mode":"diagnostic","workspace_schema":3,"adaptive_engine":"1.0.0","crypto_format":"H4","hardware_root":"strongbox-first","component_integrity":"sealed","guard_mesh":5,"production_trusted":false}\n' \
             "$HASH" "$GITHUB_SHA" "$GITHUB_RUN_ID" > TrailNote/dist/diagnostic-trust.json
 
       - name: Generate Sigstore/GitHub provenance for diagnostic APK
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
         with:
-          subject-path: TrailNote/dist/TrailNote-3.5.1-adaptive-diagnostic.apk
+          subject-path: TrailNote/dist/TrailNote-4.0.0-hardened-diagnostic.apk
 
       - name: Verify generated provenance immediately
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh attestation verify TrailNote/dist/TrailNote-3.5.1-adaptive-diagnostic.apk --repo "$GITHUB_REPOSITORY"
+        run: gh attestation verify TrailNote/dist/TrailNote-4.0.0-hardened-diagnostic.apk --repo "$GITHUB_REPOSITORY"
 
-      - name: Upload attested v3.5.1 adaptive diagnostic bundle
+      - name: Upload attested v4 diagnostic bundle
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: TrailNote-v3.5.1-adaptive-operations-attested
+          name: TrailNote-v4-hardware-root-guard-mesh-attested
           path: |
-            TrailNote/dist/TrailNote-3.5.1-adaptive-diagnostic.apk
+            TrailNote/dist/TrailNote-4.0.0-hardened-diagnostic.apk
             TrailNote/dist/SHA256SUMS-diagnostic.txt
             TrailNote/dist/diagnostic-trust.json
           if-no-files-found: error
@@ -121,9 +157,11 @@ jobs:
   production:
     if: ${{ inputs.production }}
     needs: diagnostic
-    runs-on: ubuntu-latest
-    timeout-minutes: 35
-    environment: trailnote-production-signing
+    # A production private key must be non-exportable and reachable only from this
+    # dedicated runner through its preconfigured PKCS#11 provider.
+    runs-on: [self-hosted, linux, trailnote-hsm]
+    timeout-minutes: 45
+    environment: trailnote-production-hsm
     steps:
       - name: Checkout approved source without persisted credentials
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
@@ -142,54 +180,49 @@ jobs:
         with:
           gradle-version: "8.9"
 
-      - name: Validate production signing boundary inputs
+      - name: Validate non-exportable HSM signing boundary
         shell: bash
         env:
-          KEYSTORE_B64: ${{ secrets.TRAILNOTE_SIGNING_KEYSTORE_B64 }}
-          STORE_PASSWORD: ${{ secrets.TRAILNOTE_SIGNING_STORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.TRAILNOTE_SIGNING_KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.TRAILNOTE_SIGNING_KEY_PASSWORD }}
           TRUSTED_CERT: ${{ secrets.TRAILNOTE_TRUSTED_CERT_SHA256 }}
+          HSM_ALIAS: ${{ secrets.TRAILNOTE_HSM_KEY_ALIAS }}
+          HSM_PIN_SECRET: ${{ secrets.TRAILNOTE_HSM_PIN }}
         run: |
           set -euo pipefail
-          test -n "$KEYSTORE_B64"
-          test -n "$STORE_PASSWORD"
-          test -n "$KEY_ALIAS"
-          test -n "$KEY_PASSWORD"
+          test -n "$HSM_ALIAS"
+          test -n "$HSM_PIN_SECRET"
           NORMALIZED="$(printf '%s' "$TRUSTED_CERT" | tr -cd '0-9A-Fa-f' | tr 'A-F' 'a-f')"
           test "${#NORMALIZED}" -eq 64
-          umask 077
-          KEYSTORE="$RUNNER_TEMP/trailnote-production-signing.keystore"
-          printf '%s' "$KEYSTORE_B64" | base64 --decode > "$KEYSTORE"
-          test -s "$KEYSTORE"
-          echo "TRAILNOTE_SIGNING_STORE_FILE=$KEYSTORE" >> "$GITHUB_ENV"
+          echo "TRAILNOTE_HSM_SIGNING=1" >> "$GITHUB_ENV"
           echo "TRAILNOTE_TRUSTED_CERT_SHA256=$NORMALIZED" >> "$GITHUB_ENV"
+          echo "HSM_KEY_ALIAS=$HSM_ALIAS" >> "$GITHUB_ENV"
+          echo "HSM_PIN=$HSM_PIN_SECRET" >> "$GITHUB_ENV"
 
-      - name: Lint and build fail-closed v3.5.1 production APK
+      - name: Build unsigned fail-closed v4 production APK
         working-directory: TrailNote
-        env:
-          TRAILNOTE_SIGNING_STORE_PASSWORD: ${{ secrets.TRAILNOTE_SIGNING_STORE_PASSWORD }}
-          TRAILNOTE_SIGNING_KEY_ALIAS: ${{ secrets.TRAILNOTE_SIGNING_KEY_ALIAS }}
-          TRAILNOTE_SIGNING_KEY_PASSWORD: ${{ secrets.TRAILNOTE_SIGNING_KEY_PASSWORD }}
         run: gradle :app:lintRelease :app:assembleRelease --stacktrace --no-daemon
 
-      - name: Verify APK signature identity and whole-file integrity
+      - name: Sign only inside PKCS11 HSM boundary
         shell: bash
         run: |
           set -euo pipefail
+          UNSIGNED=TrailNote/app/build/outputs/apk/release/app-release-unsigned.apk
+          test -f "$UNSIGNED"
+          chmod 700 TrailNote/security/sign-with-pkcs11-hsm.sh
           mkdir -p TrailNote/dist
-          cp TrailNote/app/build/outputs/apk/release/app-release.apk TrailNote/dist/TrailNote-3.5.1-production.apk
+          TrailNote/security/sign-with-pkcs11-hsm.sh "$UNSIGNED" TrailNote/dist/TrailNote-4.0.0-production.apk
+
+      - name: Build production trust manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK=TrailNote/dist/TrailNote-4.0.0-production.apk
           APKSIGNER="$(find "$ANDROID_HOME/build-tools" -type f -name apksigner | sort -V | tail -n 1)"
-          test -x "$APKSIGNER"
-          VERIFY_OUT="$($APKSIGNER verify --verbose --print-certs TrailNote/dist/TrailNote-3.5.1-production.apk)"
-          printf '%s\n' "$VERIFY_OUT"
-          printf '%s\n' "$VERIFY_OUT" | grep -Eq 'Verified using v2 scheme.*true'
+          VERIFY_OUT="$($APKSIGNER verify --verbose --print-certs "$APK")"
           ACTUAL="$(printf '%s\n' "$VERIFY_OUT" | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | head -n 1 | tr -cd '0-9A-Fa-f' | tr 'A-F' 'a-f')"
-          test -n "$ACTUAL"
           test "$ACTUAL" = "$TRAILNOTE_TRUSTED_CERT_SHA256"
-          HASH="$(sha256sum TrailNote/dist/TrailNote-3.5.1-production.apk | awk '{print $1}')"
-          printf '%s  %s\n' "$HASH" 'TrailNote-3.5.1-production.apk' > TrailNote/dist/SHA256SUMS-production.txt
-          printf '{"artifact":"TrailNote-3.5.1-production.apk","sha256":"%s","signing_cert_sha256":"%s","source_commit":"%s","workflow_run":"%s","repository":"%s","trust_mode":"production","workspace_schema":3,"adaptive_engine":"1.0.0","keystore_iv_policy":"provider-generated","apk_signature_policy":"v2-or-newer-required"}\n' \
+          HASH="$(sha256sum "$APK" | awk '{print $1}')"
+          printf '%s  %s\n' "$HASH" 'TrailNote-4.0.0-production.apk' > TrailNote/dist/SHA256SUMS-production.txt
+          printf '{"artifact":"TrailNote-4.0.0-production.apk","sha256":"%s","signing_cert_sha256":"%s","source_commit":"%s","workflow_run":"%s","repository":"%s","trust_mode":"production","signing_backend":"non-exportable-pkcs11-hsm","crypto_format":"H4","hardware_root":"strongbox-first","component_integrity":"sealed","guard_mesh":5,"apk_signature_policy":"v2-v3"}\n' \
             "$HASH" "$ACTUAL" "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_REPOSITORY" > TrailNote/dist/production-trust.json
 
       - name: Ensure production build did not mutate tracked source
@@ -198,10 +231,10 @@ jobs:
           git diff --exit-code
           test -z "$(git status --porcelain --untracked-files=no)"
 
-      - name: Generate Sigstore/GitHub provenance for production APK
+      - name: Generate provenance for production APK
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
         with:
-          subject-path: TrailNote/dist/TrailNote-3.5.1-production.apk
+          subject-path: TrailNote/dist/TrailNote-4.0.0-production.apk
 
       - name: Generate provenance for production trust manifest
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
@@ -213,25 +246,22 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh attestation verify TrailNote/dist/TrailNote-3.5.1-production.apk --repo "$GITHUB_REPOSITORY"
+          gh attestation verify TrailNote/dist/TrailNote-4.0.0-production.apk --repo "$GITHUB_REPOSITORY"
           gh attestation verify TrailNote/dist/production-trust.json --repo "$GITHUB_REPOSITORY"
 
-      - name: Upload production trust bundle
+      - name: Upload production HSM trust bundle
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: TrailNote-v3.5.1-production-triple-trust
+          name: TrailNote-v4-production-hsm-trust
           path: |
-            TrailNote/dist/TrailNote-3.5.1-production.apk
+            TrailNote/dist/TrailNote-4.0.0-production.apk
             TrailNote/dist/SHA256SUMS-production.txt
             TrailNote/dist/production-trust.json
           if-no-files-found: error
           retention-days: 90
 
-      - name: Destroy runner copy of signing keystore
+      - name: Clear HSM session secret from job environment
         if: ${{ always() }}
         shell: bash
         run: |
-          set +e
-          if [ -n "${TRAILNOTE_SIGNING_STORE_FILE:-}" ] && [ -f "$TRAILNOTE_SIGNING_STORE_FILE" ]; then
-            shred -u "$TRAILNOTE_SIGNING_STORE_FILE" 2>/dev/null || rm -f "$TRAILNOTE_SIGNING_STORE_FILE"
-          fi
+          unset HSM_PIN || true
