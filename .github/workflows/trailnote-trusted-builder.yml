@@ -49,7 +49,20 @@ jobs:
           grep -q "Production build refused" "$LOG"
           echo "PASS: production build is fail-closed outside the protected signing environment."
 
-      - name: Lint and build TrailNote v3 diagnostic APKs
+      - name: Verify Adaptive Operations Core is wired into workspace mutations
+        shell: bash
+        run: |
+          set -euo pipefail
+          CORE=TrailNote/app/src/main/java/com/rstlab/trailnote/workspace/adaptive/AdaptiveOperationsCore.java
+          REPO=TrailNote/app/src/main/java/com/rstlab/trailnote/workspace/WorkspaceRepository.java
+          test -s "$CORE"
+          grep -q 'AdaptiveOperationsCore.apply' "$REPO"
+          grep -q '#manual' "$CORE"
+          grep -q 'restrictedAccess' "$CORE"
+          grep -q '撮影計画を自動生成' "$CORE"
+          grep -q '現地下見・安全確認ミッションを生成' "$CORE"
+
+      - name: Lint and build TrailNote v3.5 adaptive diagnostic APKs
         working-directory: TrailNote
         run: gradle :app:lintHardened :app:assembleHardened :app:assembleDebug --stacktrace --no-daemon
 
@@ -59,33 +72,33 @@ jobs:
           git diff --exit-code
           test -z "$(git status --porcelain --untracked-files=no)"
 
-      - name: Build v3 diagnostic integrity manifest
+      - name: Build v3.5 diagnostic integrity manifest
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p TrailNote/dist
-          cp TrailNote/app/build/outputs/apk/hardened/app-hardened.apk TrailNote/dist/TrailNote-3.0.0-diagnostic.apk
-          HASH="$(sha256sum TrailNote/dist/TrailNote-3.0.0-diagnostic.apk | awk '{print $1}')"
-          printf '%s  %s\n' "$HASH" 'TrailNote-3.0.0-diagnostic.apk' > TrailNote/dist/SHA256SUMS-diagnostic.txt
-          printf '{"artifact":"TrailNote-3.0.0-diagnostic.apk","sha256":"%s","source_commit":"%s","workflow_run":"%s","trust_mode":"diagnostic","workspace_schema":3,"production_trusted":false}\n' \
+          cp TrailNote/app/build/outputs/apk/hardened/app-hardened.apk TrailNote/dist/TrailNote-3.5.0-adaptive-diagnostic.apk
+          HASH="$(sha256sum TrailNote/dist/TrailNote-3.5.0-adaptive-diagnostic.apk | awk '{print $1}')"
+          printf '%s  %s\n' "$HASH" 'TrailNote-3.5.0-adaptive-diagnostic.apk' > TrailNote/dist/SHA256SUMS-diagnostic.txt
+          printf '{"artifact":"TrailNote-3.5.0-adaptive-diagnostic.apk","sha256":"%s","source_commit":"%s","workflow_run":"%s","trust_mode":"diagnostic","workspace_schema":3,"adaptive_engine":"1.0.0","production_trusted":false}\n' \
             "$HASH" "$GITHUB_SHA" "$GITHUB_RUN_ID" > TrailNote/dist/diagnostic-trust.json
 
       - name: Generate Sigstore/GitHub provenance for diagnostic APK
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
         with:
-          subject-path: TrailNote/dist/TrailNote-3.0.0-diagnostic.apk
+          subject-path: TrailNote/dist/TrailNote-3.5.0-adaptive-diagnostic.apk
 
       - name: Verify generated provenance immediately
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh attestation verify TrailNote/dist/TrailNote-3.0.0-diagnostic.apk --repo "$GITHUB_REPOSITORY"
+        run: gh attestation verify TrailNote/dist/TrailNote-3.5.0-adaptive-diagnostic.apk --repo "$GITHUB_REPOSITORY"
 
-      - name: Upload attested v3 diagnostic bundle
+      - name: Upload attested v3.5 adaptive diagnostic bundle
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: TrailNote-v3.0-operations-attested
+          name: TrailNote-v3.5-adaptive-operations-attested
           path: |
-            TrailNote/dist/TrailNote-3.0.0-diagnostic.apk
+            TrailNote/dist/TrailNote-3.5.0-adaptive-diagnostic.apk
             TrailNote/dist/SHA256SUMS-diagnostic.txt
             TrailNote/dist/diagnostic-trust.json
           if-no-files-found: error
@@ -138,7 +151,7 @@ jobs:
           echo "TRAILNOTE_SIGNING_STORE_FILE=$KEYSTORE" >> "$GITHUB_ENV"
           echo "TRAILNOTE_TRUSTED_CERT_SHA256=$NORMALIZED" >> "$GITHUB_ENV"
 
-      - name: Lint and build fail-closed v3 production APK
+      - name: Lint and build fail-closed v3.5 production APK
         working-directory: TrailNote
         env:
           TRAILNOTE_SIGNING_STORE_PASSWORD: ${{ secrets.TRAILNOTE_SIGNING_STORE_PASSWORD }}
@@ -151,18 +164,18 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p TrailNote/dist
-          cp TrailNote/app/build/outputs/apk/release/app-release.apk TrailNote/dist/TrailNote-3.0.0-production.apk
+          cp TrailNote/app/build/outputs/apk/release/app-release.apk TrailNote/dist/TrailNote-3.5.0-production.apk
           APKSIGNER="$(find "$ANDROID_HOME/build-tools" -type f -name apksigner | sort -V | tail -n 1)"
           test -x "$APKSIGNER"
-          VERIFY_OUT="$($APKSIGNER verify --verbose --print-certs TrailNote/dist/TrailNote-3.0.0-production.apk)"
+          VERIFY_OUT="$($APKSIGNER verify --verbose --print-certs TrailNote/dist/TrailNote-3.5.0-production.apk)"
           printf '%s\n' "$VERIFY_OUT"
           printf '%s\n' "$VERIFY_OUT" | grep -Eq 'Verified using v2 scheme.*true'
           ACTUAL="$(printf '%s\n' "$VERIFY_OUT" | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | head -n 1 | tr -cd '0-9A-Fa-f' | tr 'A-F' 'a-f')"
           test -n "$ACTUAL"
           test "$ACTUAL" = "$TRAILNOTE_TRUSTED_CERT_SHA256"
-          HASH="$(sha256sum TrailNote/dist/TrailNote-3.0.0-production.apk | awk '{print $1}')"
-          printf '%s  %s\n' "$HASH" 'TrailNote-3.0.0-production.apk' > TrailNote/dist/SHA256SUMS-production.txt
-          printf '{"artifact":"TrailNote-3.0.0-production.apk","sha256":"%s","signing_cert_sha256":"%s","source_commit":"%s","workflow_run":"%s","repository":"%s","trust_mode":"production","workspace_schema":3,"apk_signature_policy":"v2-or-newer-required"}\n' \
+          HASH="$(sha256sum TrailNote/dist/TrailNote-3.5.0-production.apk | awk '{print $1}')"
+          printf '%s  %s\n' "$HASH" 'TrailNote-3.5.0-production.apk' > TrailNote/dist/SHA256SUMS-production.txt
+          printf '{"artifact":"TrailNote-3.5.0-production.apk","sha256":"%s","signing_cert_sha256":"%s","source_commit":"%s","workflow_run":"%s","repository":"%s","trust_mode":"production","workspace_schema":3,"adaptive_engine":"1.0.0","apk_signature_policy":"v2-or-newer-required"}\n' \
             "$HASH" "$ACTUAL" "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_REPOSITORY" > TrailNote/dist/production-trust.json
 
       - name: Ensure production build did not mutate tracked source
@@ -174,7 +187,7 @@ jobs:
       - name: Generate Sigstore/GitHub provenance for production APK
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
         with:
-          subject-path: TrailNote/dist/TrailNote-3.0.0-production.apk
+          subject-path: TrailNote/dist/TrailNote-3.5.0-production.apk
 
       - name: Generate provenance for production trust manifest
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
@@ -186,15 +199,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh attestation verify TrailNote/dist/TrailNote-3.0.0-production.apk --repo "$GITHUB_REPOSITORY"
+          gh attestation verify TrailNote/dist/TrailNote-3.5.0-production.apk --repo "$GITHUB_REPOSITORY"
           gh attestation verify TrailNote/dist/production-trust.json --repo "$GITHUB_REPOSITORY"
 
       - name: Upload production trust bundle
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: TrailNote-v3.0-production-triple-trust
+          name: TrailNote-v3.5-production-triple-trust
           path: |
-            TrailNote/dist/TrailNote-3.0.0-production.apk
+            TrailNote/dist/TrailNote-3.5.0-production.apk
             TrailNote/dist/SHA256SUMS-production.txt
             TrailNote/dist/production-trust.json
           if-no-files-found: error
